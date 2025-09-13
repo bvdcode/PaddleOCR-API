@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from paddleocr import PaddleOCR
 import inspect
 import logging
+import numpy as np
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -111,56 +112,42 @@ def pdf_to_images(pdf_bytes: bytes, dpi: int = 350) -> List[Image.Image]:
 
 
 def extract_text_from_image(image: Image.Image, lang: str) -> str:
+    """Force legacy .ocr() call with numpy array input (stable) and suppress Paddle's stdout.
+
+    We intentionally ignore the newer predict() path because it produced empty results
+    in this deployment. We silence verbose output and only return concatenated text.
+    """
     try:
-        buf = io.BytesIO()
-        image.save(buf, format='PNG')
-        buf.seek(0)
         ocr_engine = get_ocr(lang)
-        data = buf.getvalue()
-        result = None
-        # Prefer new predict API if available
-        if hasattr(ocr_engine, 'predict'):
+        arr = np.array(image.convert('RGB'))  # ensure 3-channel
+        import contextlib
+        import io as _io
+        capture = _io.StringIO()
+        # Only show debug if OCR_DEBUG=1
+        debug = os.getenv('OCR_DEBUG', '0').lower() in {'1', 'true', 'yes'}
+        if debug:
             try:
-                result = ocr_engine.predict(images=[data])
+                result = ocr_engine.ocr(arr, cls=True)
             except TypeError:
-                # some versions might accept raw bytes
+                result = ocr_engine.ocr(arr)
+        else:
+            with contextlib.redirect_stdout(capture), contextlib.redirect_stderr(capture):
                 try:
-                    result = ocr_engine.predict(data)
-                except Exception:
-                    result = None
-            except Exception:
-                result = None
-        # Fallback to legacy .ocr()
-        if result is None:
-            try:
-                result = ocr_engine.ocr(data, cls=True)
-            except TypeError:
-                result = ocr_engine.ocr(data)
+                    result = ocr_engine.ocr(arr, cls=True)
+                except TypeError:
+                    result = ocr_engine.ocr(arr)
         lines: List[str] = []
-        try:
-            # Attempt to normalize different result schemas
-            if isinstance(result, list):
-                # Typical legacy format: [ [ [box, (text, conf)], ... ] ]
-                candidate = result[0] if result and isinstance(
-                    result[0], list) else result
-                for line in candidate:
-                    if isinstance(line, (list, tuple)):
-                        if len(line) >= 2:
-                            txt_part = line[1]
-                            if isinstance(txt_part, (list, tuple)) and txt_part:
-                                lines.append(str(txt_part[0]))
-                            elif isinstance(txt_part, str):
-                                lines.append(txt_part)
-                    elif isinstance(line, dict) and 'text' in line:
-                        lines.append(str(line['text']))
-            elif isinstance(result, dict):
-                if 'data' in result and isinstance(result['data'], list):
-                    for item in result['data']:
-                        if isinstance(item, dict) and 'text' in item:
-                            lines.append(str(item['text']))
-        except Exception as parse_err:
-            logger.warning(f"Failed parsing OCR result: {parse_err}")
-        return '\n'.join([l for l in lines if l])
+        if isinstance(result, list) and result:
+            block = result[0]
+            if isinstance(block, list):
+                for entry in block:
+                    if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                        txt = entry[1]
+                        if isinstance(txt, (list, tuple)) and txt:
+                            lines.append(str(txt[0]))
+                        elif isinstance(txt, str):
+                            lines.append(txt)
+        return '\n'.join(lines)
     except Exception as e:
         logger.error(f"Error extracting text: {e}")
         return ""
