@@ -8,6 +8,7 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import JSONResponse
 import paddleocr
 from paddleocr import PaddleOCR
+import inspect
 import logging
 
 # Configure logging
@@ -20,31 +21,38 @@ app = FastAPI(
     version="1.0.0"
 )
 
+def _filter_kwargs(callable_obj, desired: Dict[str, Any]) -> Dict[str, Any]:
+    """Return only kwargs accepted by callable_obj from desired dict."""
+    try:
+        sig = inspect.signature(callable_obj)
+        accepted = {k: v for k, v in desired.items() if k in sig.parameters}
+        dropped = set(desired.keys()) - set(accepted.keys())
+        if dropped:
+            logger.info(f"Dropped unsupported args for {callable_obj.__name__}: {dropped}")
+        return accepted
+    except (ValueError, TypeError):  # builtins / C extensions fallback
+        return desired
+
 def create_ocr() -> PaddleOCR:
-    """Create PaddleOCR instance (CPU). Newer versions removed 'use_gpu' arg.
-    Tries without use_gpu first, falls back if needed.
-    """
-    base_kwargs = dict(
+    """Create PaddleOCR instance (CPU) with dynamic arg filtering for version compatibility."""
+    base_desired = dict(
         use_angle_cls=True,
         lang='ru',
-        show_log=False
+        show_log=False,
+        use_gpu=False  # include, will be filtered if removed
     )
+    filtered = _filter_kwargs(PaddleOCR, base_desired)
     try:
-        # Preferred (no use_gpu for >=3.2.0)
-        return PaddleOCR(**base_kwargs)
-    except TypeError as e:
-        if 'use_gpu' in str(e):
-            # Unexpected, but log and retry without param
-            logger.warning("PaddleOCR signature changed, retrying without GPU param")
-            return PaddleOCR(**base_kwargs)
-        # Some older versions still require explicit use_gpu? try adding
-        try:
-            logger.info("Retrying PaddleOCR init with use_gpu=False")
-            return PaddleOCR(use_gpu=False, **base_kwargs)  # type: ignore
-        except Exception:
-            raise
-    except Exception:
-        raise
+        o = PaddleOCR(**filtered)
+        logger.info(f"Initialized PaddleOCR with args: {filtered}")
+        return o
+    except Exception as e:
+        logger.error(f"Failed to init PaddleOCR with {filtered}: {e}")
+        # Last resort: try minimal
+        minimal = _filter_kwargs(PaddleOCR, dict(lang='ru'))
+        o = PaddleOCR(**minimal)
+        logger.info(f"Initialized PaddleOCR with minimal args: {minimal}")
+        return o
 
 ocr = create_ocr()
 
@@ -52,19 +60,18 @@ ocr = create_ocr()
 try:
     from paddleocr import PPStructure
     def create_table_engine():
-        base_kwargs = dict(lang='ru', show_log=False)
+        desired = dict(lang='ru', show_log=False, use_gpu=False)
+        filtered = _filter_kwargs(PPStructure, desired)
         try:
-            return PPStructure(**base_kwargs)
-        except TypeError as e:
-            if 'use_gpu' in str(e):
-                logger.warning("PPStructure signature changed, retrying")
-                return PPStructure(**base_kwargs)
-            try:
-                return PPStructure(use_gpu=False, **base_kwargs)  # type: ignore
-            except Exception:
-                raise
-        except Exception:
-            raise
+            te = PPStructure(**filtered)
+            logger.info(f"Initialized PPStructure with args: {filtered}")
+            return te
+        except Exception as e:
+            logger.error(f"Failed to init PPStructure with {filtered}: {e}")
+            minimal = _filter_kwargs(PPStructure, dict(lang='ru'))
+            te = PPStructure(**minimal)
+            logger.info(f"Initialized PPStructure with minimal args: {minimal}")
+            return te
     table_engine = create_table_engine()
 except ImportError:
     logger.warning("PP-Structure not available, table detection will be disabled")
