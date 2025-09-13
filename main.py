@@ -20,22 +20,52 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Initialize PaddleOCR (CPU version)
-ocr = PaddleOCR(
-    use_angle_cls=True,  # Enable angle classification
-    lang='ru',           # Russian language
-    use_gpu=False,       # CPU-only
-    show_log=False       # Reduce log output
-)
+def create_ocr() -> PaddleOCR:
+    """Create PaddleOCR instance (CPU). Newer versions removed 'use_gpu' arg.
+    Tries without use_gpu first, falls back if needed.
+    """
+    base_kwargs = dict(
+        use_angle_cls=True,
+        lang='ru',
+        show_log=False
+    )
+    try:
+        # Preferred (no use_gpu for >=3.2.0)
+        return PaddleOCR(**base_kwargs)
+    except TypeError as e:
+        if 'use_gpu' in str(e):
+            # Unexpected, but log and retry without param
+            logger.warning("PaddleOCR signature changed, retrying without GPU param")
+            return PaddleOCR(**base_kwargs)
+        # Some older versions still require explicit use_gpu? try adding
+        try:
+            logger.info("Retrying PaddleOCR init with use_gpu=False")
+            return PaddleOCR(use_gpu=False, **base_kwargs)  # type: ignore
+        except Exception:
+            raise
+    except Exception:
+        raise
+
+ocr = create_ocr()
 
 # Initialize PP-Structure for table detection
 try:
     from paddleocr import PPStructure
-    table_engine = PPStructure(
-        lang='ru',
-        use_gpu=False,
-        show_log=False
-    )
+    def create_table_engine():
+        base_kwargs = dict(lang='ru', show_log=False)
+        try:
+            return PPStructure(**base_kwargs)
+        except TypeError as e:
+            if 'use_gpu' in str(e):
+                logger.warning("PPStructure signature changed, retrying")
+                return PPStructure(**base_kwargs)
+            try:
+                return PPStructure(use_gpu=False, **base_kwargs)  # type: ignore
+            except Exception:
+                raise
+        except Exception:
+            raise
+    table_engine = create_table_engine()
 except ImportError:
     logger.warning("PP-Structure not available, table detection will be disabled")
     table_engine = None
