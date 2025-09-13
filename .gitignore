@@ -64,3 +64,8 @@ models/
 
 # Docker
 .dockerignore
+
+# Development and testing files
+test_service.py
+example_client.py
+verify_structure.py
