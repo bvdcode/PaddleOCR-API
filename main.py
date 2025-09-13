@@ -1,7 +1,6 @@
 import io
 import os
-import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from PIL import Image
 import pdf2image
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -112,7 +111,7 @@ def pdf_to_images(pdf_bytes: bytes, dpi: int = 350) -> List[Image.Image]:
             status_code=400, detail=f"Error processing PDF: {e}")
 
 
-def extract_text_from_image(image: Image.Image, lang: str) -> str:
+def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
     """Run legacy .ocr() and extract text robustly.
 
     Adds:
@@ -143,80 +142,106 @@ def extract_text_from_image(image: Image.Image, lang: str) -> str:
                     result = ocr_engine.ocr(arr)
         elapsed = (time.time() - t0) * 1000
 
-        lines: List[str] = []
+        # We'll collect structured line objects: {text, confidence, box}
+        structured: List[Dict[str, Any]] = []
+        lines_plain: List[str] = []
 
         # Primary (legacy) pattern
         if isinstance(result, list) and result:
             first = result[0]
             if isinstance(first, list):
                 for entry in first:
+                    # legacy entry: [box, (text, conf)]
                     if isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                        txt = entry[1]
-                        if isinstance(txt, (list, tuple)) and txt:
-                            lines.append(str(txt[0]))
-                        elif isinstance(txt, str):
-                            lines.append(txt)
+                        box = entry[0]
+                        txt_part = entry[1]
+                        text_val: Optional[str] = None
+                        conf_val: Optional[float] = None
+                        if isinstance(txt_part, (list, tuple)) and txt_part:
+                            text_val = str(txt_part[0])
+                            if len(txt_part) > 1:
+                                try:
+                                    conf_val = float(txt_part[1])
+                                except Exception:
+                                    conf_val = None
+                        elif isinstance(txt_part, str):
+                            text_val = txt_part
+                        if text_val:
+                            lines_plain.append(text_val)
+                            structured.append({
+                                "text": text_val,
+                                "confidence": conf_val,
+                                "box": box if isinstance(box, (list, tuple)) else None
+                            })
 
         # Secondary: list of dicts with 'text'
-        if not lines and isinstance(result, list):
+        if not structured and isinstance(result, list):
             for item in result:
                 if isinstance(item, dict) and 'text' in item and isinstance(item['text'], str):
-                    lines.append(item['text'])
+                    structured.append({
+                        "text": item['text'],
+                        "confidence": item.get('confidence') or item.get('score'),
+                        "box": item.get('box') or item.get('bbox')
+                    })
+                    lines_plain.append(item['text'])
 
         # Tertiary: dict with 'data' or nested lists
-        if not lines and isinstance(result, dict):
+        if not structured and isinstance(result, dict):
             data = result.get('data') or result.get('res')
             if isinstance(data, list):
                 for item in data:
                     if isinstance(item, dict) and 'text' in item and isinstance(item['text'], str):
-                        lines.append(item['text'])
+                        structured.append({
+                            "text": item['text'],
+                            "confidence": item.get('confidence') or item.get('score'),
+                            "box": item.get('box') or item.get('bbox')
+                        })
+                        lines_plain.append(item['text'])
 
         # Deep recursive fallback (guarded) if still empty
         deep_enabled = os.getenv('OCR_DEEP_PARSE', '1').lower() in {
             '1', 'true', 'yes'}
-        if not lines and deep_enabled:
+        if not structured and deep_enabled:
             collected: List[str] = []
-            # latin or cyrillic presence
-            pattern = re.compile(r'[\w\u0400-\u04FF]')
 
             def visit(obj, depth=0):
-                if len(collected) >= 500:  # hard cap
+                if len(collected) >= 500:
                     return
                 if isinstance(obj, (list, tuple)):
                     for x in obj:
                         visit(x, depth+1)
                 elif isinstance(obj, dict):
-                    # direct text fields
                     for k in ('text', 'transcription', 'value'):
                         v = obj.get(k)
-                        if isinstance(v, str) and 1 <= len(v) <= 512 and pattern.search(v):
+                        if isinstance(v, str) and 1 <= len(v) <= 512:
                             collected.append(v)
                     for v in obj.values():
                         if isinstance(v, (list, tuple, dict)):
                             visit(v, depth+1)
                 elif isinstance(obj, str):
-                    if 1 <= len(obj) <= 64 and pattern.search(obj):
+                    if 1 <= len(obj) <= 64:
                         collected.append(obj)
 
             visit(result)
-            # De-dup preserve order
             seen = set()
             for t in collected:
                 if t not in seen:
                     seen.add(t)
-                    lines.append(t)
+                    lines_plain.append(t)
+                    structured.append(
+                        {"text": t, "confidence": None, "box": None})
 
-        text = '\n'.join(lines)
+        full_text = '\n'.join(lines_plain)
         if os.getenv('OCR_LOG_COUNTS', '1').lower() in {'1', 'true', 'yes'}:
             logger.info(
-                f"OCR page: lines={len(lines)} chars={len(text)} time_ms={elapsed:.1f}")
-        if debug and not lines:
+                f"OCR page: lines={len(structured)} chars={len(full_text)} time_ms={elapsed:.1f}")
+        if debug and not structured:
             raw_repr = str(result)
             logger.debug(f"RAW OCR RESULT SAMPLE (trim): {raw_repr[:800]}")
-        return text
+        return {"full_text": full_text, "lines": structured}
     except Exception as e:
         logger.error(f"Error extracting text: {e}")
-        return ""
+        return {"full_text": "", "lines": []}
 
 
 def extract_tables_from_image(image: Image.Image) -> List[Dict[str, Any]]:
@@ -244,10 +269,11 @@ def extract_tables_from_image(image: Image.Image) -> List[Dict[str, Any]]:
 
 
 def process_image(image: Image.Image, page_index: int, lang: str, return_html: bool = False) -> Dict[str, Any]:
-    text_full = extract_text_from_image(image, lang)
+    text_struct = extract_text_from_image(image, lang)
+    text_full = text_struct["full_text"]
     tables = extract_tables_from_image(image)
     page: Dict[str, Any] = {"index": page_index,
-                            "text": {"full": text_full, "length": len(text_full)}, "tables": tables}
+                            "text": {"full": text_full, "length": len(text_full), "lines": text_struct["lines"]}, "tables": tables}
     if return_html:
         html = f"<div class='page' data-page='{page_index}'>"
         html += f"<div class='text'>{text_full.replace(chr(10), '<br>')}</div>"
@@ -274,17 +300,26 @@ async def analyze(
     pages: str = Form(""),
     lang: str = Form("ru"),
     return_html: bool = Form(False),
-    return_text: bool = Form(True)
+    return_text: bool = Form(True),
+    return_raw: bool = Form(False)
 ):
     try:
+        import time
+        t_start = time.time()
+        logger.info("[pipeline] file received: name=%s content_type=%s",
+                    file.filename, file.content_type)
         ct = (file.content_type or '').lower()
         if not any(t in ct for t in ['pdf', 'png', 'jpg', 'jpeg', 'image']):
             raise HTTPException(
                 status_code=400, detail='Unsupported file type. Only PDF, PNG, JPG.')
         data = await file.read()
+        logger.info("[pipeline] file size=%d bytes", len(data))
         if 'pdf' in ct:
+            t_pdf0 = time.time()
             images = pdf_to_images(data, dpi=dpi)
             total = len(images)
+            logger.info("[pipeline] pdf rendered pages=%d dpi=%d render_ms=%.1f",
+                        total, dpi, (time.time()-t_pdf0)*1000)
             page_nums = parse_pages(pages, total)
             selected = [(images[p-1], p) for p in page_nums if 1 <= p <= total]
         else:
@@ -293,12 +328,28 @@ async def analyze(
         # normalize / restrict language token (basic safety)
         lang_norm = ''.join(
             [c for c in lang.lower() if c.isalnum() or c in {'_', '-'}]) or 'ru'
-        pages_out = [process_image(img, idx, lang_norm, return_html)
-                     for img, idx in selected]
+        pages_out = []
+        for i, (img, idx) in enumerate(selected, 1):
+            t_p0 = time.time()
+            page_obj = process_image(img, idx, lang_norm, return_html)
+            pages_out.append(page_obj)
+            logger.info("[pipeline] page %d/%d processed lines=%s chars=%s time_ms=%.1f", i, len(selected),
+                        len(page_obj['text'].get('lines', [])
+                            ) if 'lines' in page_obj['text'] else 'n/a',
+                        page_obj['text'].get('length'), (time.time()-t_p0)*1000)
+        logger.info("[pipeline] done pages=%d total_ms=%.1f",
+                    len(selected), (time.time()-t_start)*1000)
         if not return_text:
             for p in pages_out:
-                p['text'].pop('full', None)
-        return JSONResponse(content={"lang": lang_norm, "pages": pages_out})
+                # keep only length & line count metadata
+                p_text = p['text']
+                p['text'] = {"length": p_text['length'],
+                             "lines_count": len(p_text.get('lines') or [])}
+        elif not return_raw:
+            # remove per-line details if raw not requested
+            for p in pages_out:
+                p['text'].pop('lines', None)
+        return JSONResponse(content={"lang": lang_norm, "pages": pages_out, "raw": return_raw})
     except HTTPException:
         raise
     except Exception as e:
