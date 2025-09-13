@@ -1,7 +1,6 @@
 import io
 import os
 from typing import List, Dict, Any
-from functools import lru_cache
 from PIL import Image
 import pdf2image
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -30,25 +29,31 @@ def _filter_kwargs(callable_obj, desired: Dict[str, Any]) -> Dict[str, Any]:
         return desired
 
 
-def create_ocr() -> PaddleOCR:
-    desired = dict(use_angle_cls=True, lang='ru',
+_OCR_CACHE: Dict[str, PaddleOCR] = {}
+
+
+def create_ocr(lang: str) -> PaddleOCR:
+    desired = dict(use_angle_cls=True, lang=lang,
                    show_log=False, use_gpu=False)
     filtered = _filter_kwargs(PaddleOCR, desired)
     try:
         inst = PaddleOCR(**filtered)
-        logger.info(f"Initialized PaddleOCR with args: {filtered}")
+        logger.info(f"Initialized PaddleOCR lang={lang} args={filtered}")
         return inst
     except Exception as e:
-        logger.warning(f"OCR init failed with {filtered}: {e}; retry minimal")
-        minimal = _filter_kwargs(PaddleOCR, dict(lang='ru'))
+        logger.warning(
+            f"OCR init failed lang={lang} {filtered}: {e}; retry minimal")
+        minimal = _filter_kwargs(PaddleOCR, dict(lang=lang))
         inst = PaddleOCR(**minimal)
-        logger.info(f"Initialized PaddleOCR with minimal args: {minimal}")
+        logger.info(
+            f"Initialized PaddleOCR minimal lang={lang} args={minimal}")
         return inst
 
 
-@lru_cache(maxsize=1)
-def get_ocr() -> PaddleOCR:
-    return create_ocr()
+def get_ocr(lang: str) -> PaddleOCR:
+    if lang not in _OCR_CACHE:
+        _OCR_CACHE[lang] = create_ocr(lang)
+    return _OCR_CACHE[lang]
 
 
 ENABLE_TABLES = os.getenv("ENABLE_TABLES", "0").lower() in {"1", "true", "yes"}
@@ -105,22 +110,57 @@ def pdf_to_images(pdf_bytes: bytes, dpi: int = 350) -> List[Image.Image]:
             status_code=400, detail=f"Error processing PDF: {e}")
 
 
-def extract_text_from_image(image: Image.Image) -> str:
+def extract_text_from_image(image: Image.Image, lang: str) -> str:
     try:
         buf = io.BytesIO()
         image.save(buf, format='PNG')
         buf.seek(0)
-        ocr_engine = get_ocr()
-        try:
-            result = ocr_engine.ocr(buf.getvalue(), cls=True)
-        except TypeError:
-            result = ocr_engine.ocr(buf.getvalue())
+        ocr_engine = get_ocr(lang)
+        data = buf.getvalue()
+        result = None
+        # Prefer new predict API if available
+        if hasattr(ocr_engine, 'predict'):
+            try:
+                result = ocr_engine.predict(images=[data])
+            except TypeError:
+                # some versions might accept raw bytes
+                try:
+                    result = ocr_engine.predict(data)
+                except Exception:
+                    result = None
+            except Exception:
+                result = None
+        # Fallback to legacy .ocr()
+        if result is None:
+            try:
+                result = ocr_engine.ocr(data, cls=True)
+            except TypeError:
+                result = ocr_engine.ocr(data)
         lines: List[str] = []
-        if result and result[0]:
-            for line in result[0]:
-                if line and len(line) >= 2:
-                    lines.append(line[1][0])
-        return '\n'.join(lines)
+        try:
+            # Attempt to normalize different result schemas
+            if isinstance(result, list):
+                # Typical legacy format: [ [ [box, (text, conf)], ... ] ]
+                candidate = result[0] if result and isinstance(
+                    result[0], list) else result
+                for line in candidate:
+                    if isinstance(line, (list, tuple)):
+                        if len(line) >= 2:
+                            txt_part = line[1]
+                            if isinstance(txt_part, (list, tuple)) and txt_part:
+                                lines.append(str(txt_part[0]))
+                            elif isinstance(txt_part, str):
+                                lines.append(txt_part)
+                    elif isinstance(line, dict) and 'text' in line:
+                        lines.append(str(line['text']))
+            elif isinstance(result, dict):
+                if 'data' in result and isinstance(result['data'], list):
+                    for item in result['data']:
+                        if isinstance(item, dict) and 'text' in item:
+                            lines.append(str(item['text']))
+        except Exception as parse_err:
+            logger.warning(f"Failed parsing OCR result: {parse_err}")
+        return '\n'.join([l for l in lines if l])
     except Exception as e:
         logger.error(f"Error extracting text: {e}")
         return ""
@@ -150,11 +190,11 @@ def extract_tables_from_image(image: Image.Image) -> List[Dict[str, Any]]:
         return []
 
 
-def process_image(image: Image.Image, page_index: int, return_html: bool = False) -> Dict[str, Any]:
-    text_full = extract_text_from_image(image)
+def process_image(image: Image.Image, page_index: int, lang: str, return_html: bool = False) -> Dict[str, Any]:
+    text_full = extract_text_from_image(image, lang)
     tables = extract_tables_from_image(image)
     page: Dict[str, Any] = {"index": page_index,
-                            "text": {"full": text_full}, "tables": tables}
+                            "text": {"full": text_full, "length": len(text_full)}, "tables": tables}
     if return_html:
         html = f"<div class='page' data-page='{page_index}'>"
         html += f"<div class='text'>{text_full.replace(chr(10), '<br>')}</div>"
@@ -179,7 +219,9 @@ async def analyze(
     file: UploadFile = File(...),
     dpi: int = Form(350),
     pages: str = Form(""),
-    return_html: bool = Form(False)
+    lang: str = Form("ru"),
+    return_html: bool = Form(False),
+    return_text: bool = Form(True)
 ):
     try:
         ct = (file.content_type or '').lower()
@@ -195,9 +237,15 @@ async def analyze(
         else:
             img = Image.open(io.BytesIO(data))
             selected = [(img, 1)]
-        pages_out = [process_image(img, idx, return_html)
+        # normalize / restrict language token (basic safety)
+        lang_norm = ''.join(
+            [c for c in lang.lower() if c.isalnum() or c in {'_', '-'}]) or 'ru'
+        pages_out = [process_image(img, idx, lang_norm, return_html)
                      for img, idx in selected]
-        return JSONResponse(content={"lang": "ru", "pages": pages_out})
+        if not return_text:
+            for p in pages_out:
+                p['text'].pop('full', None)
+        return JSONResponse(content={"lang": lang_norm, "pages": pages_out})
     except HTTPException:
         raise
     except Exception as e:
