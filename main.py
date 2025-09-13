@@ -1,5 +1,6 @@
 import io
 import os
+import re
 from typing import List, Dict, Any
 from PIL import Image
 import pdf2image
@@ -112,19 +113,23 @@ def pdf_to_images(pdf_bytes: bytes, dpi: int = 350) -> List[Image.Image]:
 
 
 def extract_text_from_image(image: Image.Image, lang: str) -> str:
-    """Force legacy .ocr() call with numpy array input (stable) and suppress Paddle's stdout.
+    """Run legacy .ocr() and extract text robustly.
 
-    We intentionally ignore the newer predict() path because it produced empty results
-    in this deployment. We silence verbose output and only return concatenated text.
+    Adds:
+      - Suppression of noisy stdout (unless OCR_DEBUG=1)
+      - Multi-schema parsing (classic list, list-of-dict, deep recurse fallback)
+      - Optional deep parse toggle (OCR_DEEP_PARSE=1)
+      - Logging of counts only (no raw text) when OCR_LOG_COUNTS=1 (default)
     """
     try:
         ocr_engine = get_ocr(lang)
-        arr = np.array(image.convert('RGB'))  # ensure 3-channel
+        arr = np.array(image.convert('RGB'))  # ensure RGB
         import contextlib
+        import time
         import io as _io
         capture = _io.StringIO()
-        # Only show debug if OCR_DEBUG=1
         debug = os.getenv('OCR_DEBUG', '0').lower() in {'1', 'true', 'yes'}
+        t0 = time.time()
         if debug:
             try:
                 result = ocr_engine.ocr(arr, cls=True)
@@ -136,18 +141,79 @@ def extract_text_from_image(image: Image.Image, lang: str) -> str:
                     result = ocr_engine.ocr(arr, cls=True)
                 except TypeError:
                     result = ocr_engine.ocr(arr)
+        elapsed = (time.time() - t0) * 1000
+
         lines: List[str] = []
+
+        # Primary (legacy) pattern
         if isinstance(result, list) and result:
-            block = result[0]
-            if isinstance(block, list):
-                for entry in block:
+            first = result[0]
+            if isinstance(first, list):
+                for entry in first:
                     if isinstance(entry, (list, tuple)) and len(entry) >= 2:
                         txt = entry[1]
                         if isinstance(txt, (list, tuple)) and txt:
                             lines.append(str(txt[0]))
                         elif isinstance(txt, str):
                             lines.append(txt)
-        return '\n'.join(lines)
+
+        # Secondary: list of dicts with 'text'
+        if not lines and isinstance(result, list):
+            for item in result:
+                if isinstance(item, dict) and 'text' in item and isinstance(item['text'], str):
+                    lines.append(item['text'])
+
+        # Tertiary: dict with 'data' or nested lists
+        if not lines and isinstance(result, dict):
+            data = result.get('data') or result.get('res')
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and 'text' in item and isinstance(item['text'], str):
+                        lines.append(item['text'])
+
+        # Deep recursive fallback (guarded) if still empty
+        deep_enabled = os.getenv('OCR_DEEP_PARSE', '1').lower() in {
+            '1', 'true', 'yes'}
+        if not lines and deep_enabled:
+            collected: List[str] = []
+            # latin or cyrillic presence
+            pattern = re.compile(r'[\w\u0400-\u04FF]')
+
+            def visit(obj, depth=0):
+                if len(collected) >= 500:  # hard cap
+                    return
+                if isinstance(obj, (list, tuple)):
+                    for x in obj:
+                        visit(x, depth+1)
+                elif isinstance(obj, dict):
+                    # direct text fields
+                    for k in ('text', 'transcription', 'value'):
+                        v = obj.get(k)
+                        if isinstance(v, str) and 1 <= len(v) <= 512 and pattern.search(v):
+                            collected.append(v)
+                    for v in obj.values():
+                        if isinstance(v, (list, tuple, dict)):
+                            visit(v, depth+1)
+                elif isinstance(obj, str):
+                    if 1 <= len(obj) <= 64 and pattern.search(obj):
+                        collected.append(obj)
+
+            visit(result)
+            # De-dup preserve order
+            seen = set()
+            for t in collected:
+                if t not in seen:
+                    seen.add(t)
+                    lines.append(t)
+
+        text = '\n'.join(lines)
+        if os.getenv('OCR_LOG_COUNTS', '1').lower() in {'1', 'true', 'yes'}:
+            logger.info(
+                f"OCR page: lines={len(lines)} chars={len(text)} time_ms={elapsed:.1f}")
+        if debug and not lines:
+            raw_repr = str(result)
+            logger.debug(f"RAW OCR RESULT SAMPLE (trim): {raw_repr[:800]}")
+        return text
     except Exception as e:
         logger.error(f"Error extracting text: {e}")
         return ""
