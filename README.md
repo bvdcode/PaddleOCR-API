@@ -15,9 +15,11 @@ A CPU-only OCR service built with FastAPI and PaddleOCR for text and table extra
 ## API Endpoints
 
 ### GET /health
+
 Health check endpoint that returns service status.
 
 **Response:**
+
 ```json
 {
   "status": "healthy",
@@ -26,15 +28,18 @@ Health check endpoint that returns service status.
 ```
 
 ### POST /analyze
+
 Analyze documents for text and table extraction.
 
 **Parameters:**
+
 - `file` (required): Document file (PDF, PNG, or JPG)
 - `dpi` (optional, default: 350): DPI for PDF conversion
 - `pages` (optional, default: all): Page specification like "1-3,5"
 - `return_html` (optional, default: false): Include HTML representation
 
 **Response:**
+
 ```json
 {
   "lang": "ru",
@@ -60,29 +65,53 @@ Analyze documents for text and table extraction.
 
 ## Installation & Usage
 
-### Using Docker Compose (Recommended)
+### Quick Start with Prebuilt Docker Image (Recommended)
 
-1. Clone the repository:
+**No need to build locally!** Use the ready-to-go image:
+
+```bash
+docker run -p 8000:8000 bvdcode/paddleocrapi:v1.0
+```
+
+The service will be available at `http://localhost:8000`
+
+### Using Docker Compose
+
+1. Clone the repository (optional, only if you want to use docker-compose):
+
 ```bash
 git clone https://github.com/bvdcode/PaddleOCR-API.git
 cd PaddleOCR-API
 ```
 
-2. Build and start the service:
-```bash
-docker-compose up --build
+2. Edit `docker-compose.yml` to use the prebuilt image:
+
+```yaml
+services:
+  paddleocr-api:
+    image: bvdcode/paddleocrapi:v1.0
+    ports:
+      - "8000:8000"
 ```
 
-The service will be available at `http://localhost:8000`
+3. Start the service:
 
-### Using Docker
+```bash
+docker-compose up
+```
 
-1. Build the image:
+---
+
+### Local Build (for development)
+
+1. Build the image manually:
+
 ```bash
 docker build -t paddleocr-api .
 ```
 
 2. Run the container:
+
 ```bash
 docker run -p 8000:8000 paddleocr-api
 ```
@@ -90,6 +119,7 @@ docker run -p 8000:8000 paddleocr-api
 ### Local Development
 
 1. Install Python 3.12 and system dependencies:
+
 ```bash
 # Ubuntu/Debian
 sudo apt-get update
@@ -100,16 +130,19 @@ brew install poppler
 ```
 
 2. Install Python dependencies:
+
 ```bash
 pip install -r requirements.txt
 ```
 
 3. Run the application:
+
 ```bash
 python main.py
 ```
 
 Or using uvicorn directly:
+
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
@@ -127,11 +160,13 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ## Usage Examples
 
 ### Health Check
+
 ```bash
 curl http://localhost:8000/health
 ```
 
 ### Analyze PDF Document
+
 ```bash
 curl -X POST "http://localhost:8000/analyze" \
   -F "file=@document.pdf" \
@@ -141,6 +176,7 @@ curl -X POST "http://localhost:8000/analyze" \
 ```
 
 ### Analyze Image
+
 ```bash
 curl -X POST "http://localhost:8000/analyze" \
   -F "file=@image.png"
