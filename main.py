@@ -250,7 +250,34 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
                     structured.append(
                         {"text": t, "confidence": None, "box": None})
 
+        # Derive normalized axis-aligned bbox for each line if quadrilateral present
+        for line in structured:
+            box = line.get('box')
+            if box and isinstance(box, (list, tuple)) and len(box) >= 4:
+                try:
+                    xs = [pt[0] for pt in box if isinstance(
+                        pt, (list, tuple)) and len(pt) >= 2]
+                    ys = [pt[1] for pt in box if isinstance(
+                        pt, (list, tuple)) and len(pt) >= 2]
+                    if xs and ys:
+                        x_min, x_max = min(xs), max(xs)
+                        y_min, y_max = min(ys), max(ys)
+                        line['bbox'] = [float(x_min), float(
+                            y_min), float(x_max), float(y_max)]
+                except Exception:
+                    pass
         full_text = '\n'.join(lines_plain)
+        # Confidence stats
+        conf_values = [c['confidence'] for c in structured if isinstance(
+            c.get('confidence'), (int, float))]
+        stats = None
+        if conf_values:
+            stats = {
+                'avg_confidence': sum(conf_values)/len(conf_values),
+                'min_confidence': min(conf_values),
+                'max_confidence': max(conf_values),
+                'count_confidence': len(conf_values)
+            }
         if os.getenv('OCR_LOG_COUNTS', '1').lower() in {'1', 'true', 'yes'}:
             logger.info(
                 f"OCR page: lines={len(structured)} chars={len(full_text)} time_ms={elapsed:.1f}")
@@ -258,7 +285,7 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
         if debug and not structured:
             raw_sample = str(result)[:800]
             logger.debug(f"RAW OCR RESULT SAMPLE (trim): {raw_sample}")
-        return {"full_text": full_text, "lines": structured, "raw": result if debug else None, "raw_sample": raw_sample}
+        return {"full_text": full_text, "lines": structured, "raw": result if debug else None, "raw_sample": raw_sample, "stats": stats}
     except Exception as e:
         logger.error(f"Error extracting text: {e}")
         return {"full_text": "", "lines": []}
@@ -333,6 +360,7 @@ def process_image(image: Image.Image, page_index: int, lang: str, do_tables: boo
         table_struct = extract_tables_from_image(image, debug)
     table_ms = (time.time() - t1)*1000 if do_tables else 0.0
     text_full = text_struct["full_text"]
+    stats = text_struct.get('stats') or {}
     page: Dict[str, Any] = {
         "index": page_index,
         "text": {
@@ -345,7 +373,8 @@ def process_image(image: Image.Image, page_index: int, lang: str, do_tables: boo
         "metrics": {
             "ocr_ms": round(ocr_ms, 2),
             "table_ms": round(table_ms, 2),
-            "total_ms": round((time.time() - t0)*1000, 2)
+            "total_ms": round((time.time() - t0)*1000, 2),
+            **({k: round(v, 6) for k, v in stats.items()} if stats else {})
         }
     }
     if debug:
