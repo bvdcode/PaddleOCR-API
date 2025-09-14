@@ -331,6 +331,7 @@ async def analyze(
         pages_out = []
         for i, (img, idx) in enumerate(selected, 1):
             t_p0 = time.time()
+            logger.info("[pipeline] page %d/%d start", i, len(selected))
             page_obj = process_image(img, idx, lang_norm, return_html)
             pages_out.append(page_obj)
             logger.info("[pipeline] page %d/%d processed lines=%s chars=%s time_ms=%.1f", i, len(selected),
