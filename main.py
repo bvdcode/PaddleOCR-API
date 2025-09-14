@@ -253,18 +253,40 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
                     })
                     lines_plain.append(item['text'])
 
-        # Tertiary: dict with 'data' or nested lists
+        # Tertiary: dict with 'data' or nested lists or modern keys (dt_polys/rec_texts)
         if not structured and isinstance(result, dict):
-            data = result.get('data') or result.get('res')
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict) and 'text' in item and isinstance(item['text'], str):
-                        structured.append({
-                            "text": item['text'],
-                            "confidence": item.get('confidence') or item.get('score'),
-                            "box": item.get('box') or item.get('bbox')
-                        })
-                        lines_plain.append(item['text'])
+            # Modern batched inference style
+            if all(k in result for k in ('dt_polys', 'rec_texts')):
+                polys = result.get('dt_polys') or []
+                texts = result.get('rec_texts') or []
+                scores = result.get('rec_scores') or []
+                for i, txt in enumerate(texts):
+                    if not isinstance(txt, str) or not txt.strip():
+                        continue
+                    poly = polys[i] if i < len(polys) else None
+                    score = None
+                    if i < len(scores) and isinstance(scores[i], (int, float)):
+                        score = float(scores[i])
+                    # Convert numpy arrays to list
+                    if hasattr(poly, 'tolist'):
+                        poly = poly.tolist()
+                    structured.append({
+                        'text': txt,
+                        'confidence': score,
+                        'box': poly
+                    })
+                    lines_plain.append(txt)
+            if not structured:
+                data = result.get('data') or result.get('res')
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and 'text' in item and isinstance(item['text'], str):
+                            structured.append({
+                                "text": item['text'],
+                                "confidence": item.get('confidence') or item.get('score'),
+                                "box": item.get('box') or item.get('bbox')
+                            })
+                            lines_plain.append(item['text'])
 
         # Deep recursive fallback (guarded) if still empty
         deep_enabled = os.getenv('OCR_DEEP_PARSE', '1').lower() in {
@@ -305,6 +327,9 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
             bbox = _coerce_bbox(box_raw)
             if bbox:
                 line['bbox'] = bbox
+            # Ensure no numpy arrays leak (JSON safe)
+            if isinstance(line.get('box'), np.ndarray):
+                line['box'] = line['box'].tolist()
         full_text = '\n'.join(lines_plain)
         # Confidence stats
         conf_values = [c['confidence'] for c in structured if isinstance(
@@ -477,6 +502,41 @@ def process_image(image: Image.Image, page_index: int, lang: str, do_tables: boo
             **({k: round(v, 6) for k, v in stats.items()} if stats else {})
         }
     }
+    # Secondary heuristic: if no tables detected but many numeric-like lines that appear columnar, attempt simple column grouping.
+    if do_tables and not page['tables']:
+        lines_with_bbox = [ln for ln in page['text']['lines'] if isinstance(
+            ln, dict) and ln.get('bbox') and isinstance(ln.get('text'), str)]
+        if len(lines_with_bbox) >= 12:
+            # Cluster by y into rows
+            rows: List[List[Dict[str, Any]]] = []
+            for ln in sorted(lines_with_bbox, key=lambda x: x['bbox'][1]):
+                placed = False
+                for r in rows:
+                    y_min = max(ln['bbox'][1], min(c['bbox'][1] for c in r))
+                    y_max = min(ln['bbox'][3], max(c['bbox'][3] for c in r))
+                    h = min(ln['bbox'][3]-ln['bbox'][1], max(c['bbox'][3]
+                            for c in r)-min(c['bbox'][1] for c in r))
+                    if h > 0 and (y_max - y_min)/h >= 0.4:
+                        r.append(ln)
+                        placed = True
+                        break
+                if not placed:
+                    rows.append([ln])
+            # Determine if there are multiple rows with 2+ columns -> treat as table
+            multi = [r for r in rows if len(r) >= 2]
+            if len(multi) >= 3 and sum(len(r) for r in multi) >= 10:
+                all_cells = []
+                x1 = min(min(c['bbox'][0] for c in r) for r in multi)
+                y1 = min(min(c['bbox'][1] for c in r) for r in multi)
+                x2 = max(max(c['bbox'][2] for c in r) for r in multi)
+                y2 = max(max(c['bbox'][3] for c in r) for r in multi)
+                for r in multi:
+                    for c in r:
+                        all_cells.append(
+                            {'text': c['text'], 'bbox': c['bbox']})
+                inferred_table = {'bbox': [x1, y1, x2, y2], 'cells': all_cells, 'cells_count': len(
+                    all_cells), 'inferred_from': 'ocr_lines'}
+                page['tables'].append(inferred_table)
     # Always include truncated raw snippets for transparency
     page["raw"] = {
         "ocr_truncated": text_struct.get("raw_truncated"),
