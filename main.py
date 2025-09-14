@@ -57,37 +57,37 @@ def get_ocr(lang: str) -> PaddleOCR:
     return _OCR_CACHE[lang]
 
 
-ENABLE_TABLES = os.getenv("ENABLE_TABLES", "0").lower() in {"1", "true", "yes"}
 _TABLE_ENGINE = None
+_TABLE_ENGINE_ATTEMPTED = False  # sentinel to avoid repeated noisy logs
 
 
 def get_table_engine():
-    global _TABLE_ENGINE
-    if not ENABLE_TABLES:
-        return None
-    if _TABLE_ENGINE is not None:
+    """Lazy init PPStructure once. No env flag required.
+
+    Returns None if PPStructure not installed or init failed. Uses a sentinel
+    to avoid re-attempt spam on every page.
+    """
+    global _TABLE_ENGINE, _TABLE_ENGINE_ATTEMPTED
+    if _TABLE_ENGINE is not None or _TABLE_ENGINE_ATTEMPTED:
         return _TABLE_ENGINE
     try:
         from paddleocr import PPStructure
     except ImportError:
-        logger.warning("PP-Structure not available")
+        logger.info("PP-Structure not installed; table extraction disabled")
+        _TABLE_ENGINE_ATTEMPTED = True
         return None
-    # Try enabling only table module; _filter_kwargs will drop unsupported keys.
     desired = dict(lang='ru', show_log=False,
                    use_gpu=False, table=True, ocr=False)
     filtered = _filter_kwargs(PPStructure, desired)
     try:
         engine = PPStructure(**filtered)
-        logger.info(f"Initialized PPStructure with args: {filtered}")
+        logger.info(f"Initialized PPStructure for tables args={filtered}")
         _TABLE_ENGINE = engine
-        return _TABLE_ENGINE
     except Exception as e:
-        logger.warning(f"PPStructure init failed: {e}; retry minimal")
-        minimal = _filter_kwargs(PPStructure, dict(lang='ru'))
-        engine = PPStructure(**minimal)
-        logger.info(f"Initialized PPStructure with minimal args: {minimal}")
-        _TABLE_ENGINE = engine
-        return _TABLE_ENGINE
+        logger.warning(f"PPStructure init failed: {e}")
+        _TABLE_ENGINE = None
+    _TABLE_ENGINE_ATTEMPTED = True
+    return _TABLE_ENGINE
 
 
 def parse_pages(pages_str: str, total_pages: int) -> List[int]:
@@ -256,7 +256,7 @@ def extract_tables_from_image(image: Image.Image) -> List[Dict[str, Any]]:
         'cells_count': int
       }
     HTML intentionally removed. If PP-Structure models are not present they
-    will be downloaded on first use. Enable with env ENABLE_TABLES=1.
+    will be downloaded automatically on first use (if supported by install).
     """
     engine = get_table_engine()
     if not engine:
@@ -290,14 +290,14 @@ def extract_tables_from_image(image: Image.Image) -> List[Dict[str, Any]]:
         return []
 
 
-def process_image(image: Image.Image, page_index: int, lang: str) -> Dict[str, Any]:
+def process_image(image: Image.Image, page_index: int, lang: str, do_tables: bool) -> Dict[str, Any]:
     """Run OCR + (optional) table detection for a single page.
 
     HTML output was removed per user request; only structured JSON is returned.
     """
     text_struct = extract_text_from_image(image, lang)
     text_full = text_struct["full_text"]
-    tables = extract_tables_from_image(image)
+    tables = extract_tables_from_image(image) if do_tables else []
     page: Dict[str, Any] = {"index": page_index,
                             "text": {"full": text_full, "length": len(text_full), "lines": text_struct["lines"]}, "tables": tables}
     return page
@@ -314,6 +314,7 @@ async def analyze(
     dpi: int = Form(350),
     pages: str = Form(""),
     lang: str = Form("ru"),
+    tables: bool = Form(True),
     return_text: bool = Form(True),
     return_raw: bool = Form(False)
 ):
@@ -346,7 +347,7 @@ async def analyze(
         for i, (img, idx) in enumerate(selected, 1):
             t_p0 = time.time()
             logger.info("[pipeline] page %d/%d start", i, len(selected))
-            page_obj = process_image(img, idx, lang_norm)
+            page_obj = process_image(img, idx, lang_norm, tables)
             pages_out.append(page_obj)
             logger.info("[pipeline] page %d/%d processed lines=%s chars=%s time_ms=%.1f", i, len(selected),
                         len(page_obj['text'].get('lines', [])
