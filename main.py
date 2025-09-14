@@ -18,6 +18,23 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="PaddleOCR API",
               description="CPU-only OCR service", version="1.0.0")
 
+# A pragmatic (not exhaustive) set of commonly used language codes that PaddleOCR accepts.
+# Full list in PaddleOCR docs is large; models will auto-download on first use for a given lang code.
+COMMON_LANGS = {
+    'ch', 'en', 'fr', 'german', 'korean', 'japan', 'chinese_cht', 'ta', 'te', 'ka', 'latin', 'arabic',
+    'cyrillic', 'devanagari', 'ru', 'it', 'es', 'pt', 'hi', 'uk', 'tr', 'ug', 'fa', 'ur', 'bn', 'vi',
+    'my', 'th', 'mr', 'ne', 'uz', 'kk', 'mn', 'he'  # etc.
+}
+
+# Optional restriction: if you want to limit which languages can be requested, set env OCR_LANG_WHITELIST="en,ru,fr".
+
+
+def _get_lang_whitelist() -> Optional[set]:
+    wl = os.getenv('OCR_LANG_WHITELIST')
+    if not wl:
+        return None
+    return {x.strip().lower() for x in wl.split(',') if x.strip()}
+
 
 def _filter_kwargs(callable_obj, desired: Dict[str, Any]) -> Dict[str, Any]:
     try:
@@ -730,12 +747,48 @@ async def health():
     return {"status": "healthy", "service": "PaddleOCR-API"}
 
 
+@app.get('/languages')
+async def list_languages():
+    """Return available common languages and (optional) enforced whitelist.
+
+    This does NOT guarantee the model is already downloaded; PaddleOCR will fetch
+    the needed weights on first use. The list is intentionally trimmed – Paddle's
+    full universe is larger. Add or remove as desired.
+    """
+    wl = _get_lang_whitelist()
+    return {
+        "common": sorted(COMMON_LANGS),
+        "whitelist": sorted(wl) if wl else None,
+        "note": "Pass ?refresh=1 to force logic change in future versions (noop now)."
+    }
+
+
+def _validate_lang(lang: Optional[str]) -> str:
+    if not lang or not lang.strip():
+        raise HTTPException(
+            status_code=400, detail="Parameter 'lang' is required and must be non-empty.")
+    lang_norm = ''.join(
+        [c for c in lang.lower() if c.isalnum() or c in {'_', '-'}])
+    if not lang_norm:
+        raise HTTPException(
+            status_code=400, detail="Parameter 'lang' after normalization became empty.")
+    wl = _get_lang_whitelist()
+    if wl is not None and lang_norm not in wl:
+        raise HTTPException(
+            status_code=400, detail=f"Language '{lang_norm}' not in whitelist. Allowed: {sorted(wl)}")
+    # If whitelist not set, we allow any token – but optionally warn if unknown vs COMMON_LANGS.
+    if wl is None and lang_norm not in COMMON_LANGS:
+        logger.info(
+            f"[lang] '{lang_norm}' not in COMMON_LANGS set; attempting anyway (Paddle may error).")
+    return lang_norm
+
+
 @app.post('/analyze')
 async def analyze(
     file: UploadFile = File(...),
     dpi: int = Form(350),
     pages: str = Form(""),
-    lang: str = Form("ru"),
+    lang: str = Form(..., description="Explicit PaddleOCR language code (required). Use /languages for a list."),
     tables: bool = Form(True),
     debug: bool = Form(False)
 ):
@@ -785,9 +838,8 @@ async def analyze(
         else:
             img = Image.open(io.BytesIO(data))
             selected = [(img, 1)]
-        # normalize / restrict language token (basic safety)
-        lang_norm = ''.join(
-            [c for c in lang.lower() if c.isalnum() or c in {'_', '-'}]) or 'ru'
+        # Validate & normalize language (required; no fallback default)
+        lang_norm = _validate_lang(lang)
         pages_out = []
         progress: List[Dict[str, Any]] = []
         for i, (img, idx) in enumerate(selected, 1):
