@@ -77,7 +77,8 @@ def get_table_engine():
         _TABLE_ENGINE_ATTEMPTED = True
         return None
     # Request table module; do not force ocr=False (can break pipeline). Use 'en' to avoid extra language-specific downloads.
-    desired = dict(lang='en', show_log=False, use_gpu=False, table=True)
+    desired = dict(lang='en', show_log=False,
+                   use_gpu=False, table=True, layout=True)
     filtered = _filter_kwargs(PPStructure, desired)
     try:
         engine = PPStructure(**filtered)
@@ -237,16 +238,17 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
         if os.getenv('OCR_LOG_COUNTS', '1').lower() in {'1', 'true', 'yes'}:
             logger.info(
                 f"OCR page: lines={len(structured)} chars={len(full_text)} time_ms={elapsed:.1f}")
+        raw_sample = None
         if debug and not structured:
-            raw_repr = str(result)
-            logger.debug(f"RAW OCR RESULT SAMPLE (trim): {raw_repr[:800]}")
-        return {"full_text": full_text, "lines": structured}
+            raw_sample = str(result)[:800]
+            logger.debug(f"RAW OCR RESULT SAMPLE (trim): {raw_sample}")
+        return {"full_text": full_text, "lines": structured, "raw": result if debug else None, "raw_sample": raw_sample}
     except Exception as e:
         logger.error(f"Error extracting text: {e}")
         return {"full_text": "", "lines": []}
 
 
-def extract_tables_from_image(image: Image.Image) -> List[Dict[str, Any]]:
+def extract_tables_from_image(image: Image.Image, debug: bool = False) -> Dict[str, Any]:
     """Extract tables using PP-Structure (if enabled) returning structured cell data only.
 
     Output per table:
@@ -260,7 +262,7 @@ def extract_tables_from_image(image: Image.Image) -> List[Dict[str, Any]]:
     """
     engine = get_table_engine()
     if not engine:
-        return []
+        return {"tables": [], "raw": None}
     try:
         arr = np.array(image.convert('RGB'))
         result = engine(arr)
@@ -290,22 +292,47 @@ def extract_tables_from_image(image: Image.Image) -> List[Dict[str, Any]]:
         if (os.getenv('TABLE_DEBUG', '0').lower() in {'1', 'true', 'yes'}) or (os.getenv('OCR_DEBUG', '0').lower() in {'1', 'true', 'yes'}):
             logger.info(
                 f"table detection: raw_items={len(result) if isinstance(result, list) else 'n/a'} tables={len(tables)} total_cells={total_cells}")
-        return tables
+        return {"tables": tables, "raw": result if debug else None}
     except Exception as e:
         logger.error(f"Error extracting tables: {e}")
-        return []
+        return {"tables": [], "raw": None, "error": str(e)}
 
 
-def process_image(image: Image.Image, page_index: int, lang: str, do_tables: bool) -> Dict[str, Any]:
+def process_image(image: Image.Image, page_index: int, lang: str, do_tables: bool, debug: bool) -> Dict[str, Any]:
     """Run OCR + (optional) table detection for a single page.
 
     HTML output was removed per user request; only structured JSON is returned.
     """
+    import time
+    t0 = time.time()
     text_struct = extract_text_from_image(image, lang)
+    ocr_ms = (time.time() - t0)*1000
+    t1 = time.time()
+    table_struct: Dict[str, Any] = {"tables": []}
+    if do_tables:
+        table_struct = extract_tables_from_image(image, debug)
+    table_ms = (time.time() - t1)*1000 if do_tables else 0.0
     text_full = text_struct["full_text"]
-    tables = extract_tables_from_image(image) if do_tables else []
-    page: Dict[str, Any] = {"index": page_index,
-                            "text": {"full": text_full, "length": len(text_full), "lines": text_struct["lines"]}, "tables": tables}
+    page: Dict[str, Any] = {
+        "index": page_index,
+        "text": {
+            "full": text_full,
+            "length": len(text_full),
+            "lines": text_struct["lines"],
+            "lines_count": len(text_struct["lines"])
+        },
+        "tables": table_struct.get("tables", []),
+        "metrics": {
+            "ocr_ms": round(ocr_ms, 2),
+            "table_ms": round(table_ms, 2),
+            "total_ms": round((time.time() - t0)*1000, 2)
+        }
+    }
+    if debug:
+        page["debug"] = {
+            "ocr_raw_sample": text_struct.get("raw_sample"),
+            "tables_raw_count": len(table_struct.get("raw", []) if isinstance(table_struct.get("raw"), list) else []),
+        }
     return page
 
 
@@ -321,8 +348,7 @@ async def analyze(
     pages: str = Form(""),
     lang: str = Form("ru"),
     tables: bool = Form(True),
-    return_text: bool = Form(True),
-    return_raw: bool = Form(False)
+    debug: bool = Form(False)
 ):
     try:
         import time
@@ -350,28 +376,26 @@ async def analyze(
         lang_norm = ''.join(
             [c for c in lang.lower() if c.isalnum() or c in {'_', '-'}]) or 'ru'
         pages_out = []
+        progress: List[Dict[str, Any]] = []
         for i, (img, idx) in enumerate(selected, 1):
             t_p0 = time.time()
-            logger.info("[pipeline] page %d/%d start", i, len(selected))
-            page_obj = process_image(img, idx, lang_norm, tables)
+            page_obj = process_image(img, idx, lang_norm, tables, debug)
             pages_out.append(page_obj)
-            logger.info("[pipeline] page %d/%d processed lines=%s chars=%s tables=%d time_ms=%.1f", i, len(selected),
-                        len(page_obj['text'].get('lines', [])
-                            ) if 'lines' in page_obj['text'] else 'n/a',
-                        page_obj['text'].get('length'), len(page_obj.get('tables') or []), (time.time()-t_p0)*1000)
-        logger.info("[pipeline] done pages=%d total_ms=%.1f",
-                    len(selected), (time.time()-t_start)*1000)
-        if not return_text:
-            for p in pages_out:
-                # keep only length & line count metadata
-                p_text = p['text']
-                p['text'] = {"length": p_text['length'],
-                             "lines_count": len(p_text.get('lines') or [])}
-        elif not return_raw:
-            # remove per-line details if raw not requested
-            for p in pages_out:
-                p['text'].pop('lines', None)
-        return JSONResponse(content={"lang": lang_norm, "pages": pages_out, "raw": return_raw})
+            progress.append({
+                "page": idx,
+                "position": i,
+                "total": len(selected),
+                "lines": page_obj['text']['lines_count'],
+                "chars": page_obj['text']['length'],
+                "tables": len(page_obj.get('tables') or []),
+                "time_ms": round((time.time()-t_p0)*1000, 2)
+            })
+        total_ms = (time.time()-t_start)*1000
+        meta = {
+            "pages_requested": len(selected),
+            "total_ms": round(total_ms, 2),
+        }
+        return JSONResponse(content={"lang": lang_norm, "pages": pages_out, "progress": progress, "meta": meta})
     except HTTPException:
         raise
     except Exception as e:
