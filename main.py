@@ -72,7 +72,9 @@ def get_table_engine():
     except ImportError:
         logger.warning("PP-Structure not available")
         return None
-    desired = dict(lang='ru', show_log=False, use_gpu=False)
+    # Try enabling only table module; _filter_kwargs will drop unsupported keys.
+    desired = dict(lang='ru', show_log=False,
+                   use_gpu=False, table=True, ocr=False)
     filtered = _filter_kwargs(PPStructure, desired)
     try:
         engine = PPStructure(**filtered)
@@ -245,27 +247,43 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
 
 
 def extract_tables_from_image(image: Image.Image) -> List[Dict[str, Any]]:
-    """Extract tables using PP-Structure (if enabled) but remove any HTML output.
+    """Extract tables using PP-Structure (if enabled) returning structured cell data only.
 
-    We purposely strip HTML because user requested no HTML in API results.
-    Returned structure per table:
-      { 'bbox': [...], 'rows': [] }
-    (rows left as an empty list placeholder for potential future structured cells)
+    Output per table:
+      {
+        'bbox': [...],
+        'cells': [ {'text': str, 'bbox': [...]} ...],
+        'cells_count': int
+      }
+    HTML intentionally removed. If PP-Structure models are not present they
+    will be downloaded on first use. Enable with env ENABLE_TABLES=1.
     """
     engine = get_table_engine()
     if not engine:
         return []
     try:
-        buf = io.BytesIO()
-        image.save(buf, format='PNG')
-        buf.seek(0)
-        result = engine(buf.getvalue())
+        arr = np.array(image.convert('RGB'))
+        result = engine(arr)
         tables: List[Dict[str, Any]] = []
+        total_cells = 0
         if result:
             for item in result:
-                if item.get('type') == 'table' and 'res' in item:
-                    # We ignore any 'html' field intentionally.
-                    tables.append({'rows': [], 'bbox': item.get('bbox', [])})
+                if isinstance(item, dict) and item.get('type') == 'table' and 'res' in item:
+                    res_block = item.get('res') or {}
+                    raw_cells = res_block.get('cells') or []
+                    cells_out: List[Dict[str, Any]] = []
+                    for c in raw_cells:
+                        if not isinstance(c, dict):
+                            continue
+                        txt = c.get('text') or c.get('cell_text') or ''
+                        bbox = c.get('bbox') or c.get('box') or None
+                        cells_out.append({'text': txt, 'bbox': bbox})
+                    total_cells += len(cells_out)
+                    tables.append({'bbox': item.get(
+                        'bbox', []), 'cells': cells_out, 'cells_count': len(cells_out)})
+        if (os.getenv('TABLE_DEBUG', '0').lower() in {'1', 'true', 'yes'}) or (os.getenv('OCR_DEBUG', '0').lower() in {'1', 'true', 'yes'}):
+            logger.info(
+                f"table detection: tables={len(tables)} total_cells={total_cells}")
         return tables
     except Exception as e:
         logger.error(f"Error extracting tables: {e}")
