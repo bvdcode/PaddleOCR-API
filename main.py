@@ -764,6 +764,14 @@ async def list_languages():
 
 
 def _validate_lang(lang: Optional[str]) -> str:
+    """Normalize and validate language code.
+
+    Rules:
+      - Must be provided and not empty after normalization.
+      - If OCR_LANG_WHITELIST set -> must be in whitelist.
+      - Else if OCR_LANG_ALLOW_ANY in {1,true,yes} -> accept anything (best-effort; Paddle may fail later).
+      - Else must be in COMMON_LANGS set; otherwise 400.
+    """
     if not lang or not lang.strip():
         raise HTTPException(
             status_code=400, detail="Parameter 'lang' is required and must be non-empty.")
@@ -773,13 +781,19 @@ def _validate_lang(lang: Optional[str]) -> str:
         raise HTTPException(
             status_code=400, detail="Parameter 'lang' after normalization became empty.")
     wl = _get_lang_whitelist()
-    if wl is not None and lang_norm not in wl:
-        raise HTTPException(
-            status_code=400, detail=f"Language '{lang_norm}' not in whitelist. Allowed: {sorted(wl)}")
-    # If whitelist not set, we allow any token – but optionally warn if unknown vs COMMON_LANGS.
-    if wl is None and lang_norm not in COMMON_LANGS:
-        logger.info(
-            f"[lang] '{lang_norm}' not in COMMON_LANGS set; attempting anyway (Paddle may error).")
+    allow_any = os.getenv('OCR_LANG_ALLOW_ANY', '0').lower() in {
+        '1', 'true', 'yes'}
+    if wl is not None:
+        if lang_norm not in wl:
+            raise HTTPException(
+                status_code=400, detail=f"Language '{lang_norm}' not in whitelist. Allowed: {sorted(wl)}")
+    else:
+        if not allow_any and lang_norm not in COMMON_LANGS:
+            raise HTTPException(
+                status_code=400, detail=f"Language '{lang_norm}' not recognized. Allowed common set: {sorted(COMMON_LANGS)}. Set OCR_LANG_ALLOW_ANY=1 to bypass.")
+        if allow_any and lang_norm not in COMMON_LANGS:
+            logger.info(
+                f"[lang] '{lang_norm}' not in COMMON_LANGS; proceeding due to OCR_LANG_ALLOW_ANY.")
     return lang_norm
 
 
@@ -802,10 +816,13 @@ async def analyze(
             raise HTTPException(
                 status_code=400, detail='Unsupported file type. Only PDF, PNG, JPG.')
         data = await file.read()
-        # Compute cache hash (depends only on file bytes + lang + tables + dpi + pages selection string)
+        # Validate & normalize language (required; no fallback default)
+        lang_norm = _validate_lang(lang)
+
+        # Compute cache hash (depends on file bytes + normalized lang + tables + dpi + pages selection string)
         h = hashlib.sha256()
         h.update(data)
-        meta_part = f"|lang={lang}|tables={tables}|dpi={dpi}|pages={pages}".encode(
+        meta_part = f"|lang={lang_norm}|tables={tables}|dpi={dpi}|pages={pages}".encode(
             'utf-8')
         h.update(meta_part)
         doc_hash = h.hexdigest()
@@ -838,8 +855,7 @@ async def analyze(
         else:
             img = Image.open(io.BytesIO(data))
             selected = [(img, 1)]
-        # Validate & normalize language (required; no fallback default)
-        lang_norm = _validate_lang(lang)
+    # (lang already validated and normalized above)
         pages_out = []
         progress: List[Dict[str, Any]] = []
         for i, (img, idx) in enumerate(selected, 1):
