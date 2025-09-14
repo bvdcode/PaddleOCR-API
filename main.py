@@ -1,6 +1,6 @@
 import io
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Iterable
 from PIL import Image
 import pdf2image
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -107,11 +107,60 @@ def parse_pages(pages_str: str, total_pages: int) -> List[int]:
 
 def pdf_to_images(pdf_bytes: bytes, dpi: int = 350) -> List[Image.Image]:
     try:
+        # Performance note: High DPI (e.g., 350) increases accuracy but also
+        # increases processing time significantly. For large PDFs consider
+        # using 200-250 DPI or dynamically downscaling oversized pages after
+        # rasterization to reduce end-to-end latency.
         return pdf2image.convert_from_bytes(pdf_bytes, dpi=dpi, fmt='RGB')
     except Exception as e:
         logger.error(f"Error converting PDF: {e}")
         raise HTTPException(
             status_code=400, detail=f"Error processing PDF: {e}")
+
+
+def _coerce_bbox(obj: Any) -> Optional[List[float]]:
+    """Attempt to coerce various bbox / polygon representations into
+    [x_min, y_min, x_max, y_max]. Accepts:
+      - list/tuple of 4 numbers already in that form
+      - list of points [[x,y], ...]
+      - dict with keys x1,y1,x2,y2 or left,top,right,bottom
+      - list of 8 numbers representing 4 (x,y) pairs
+    Returns None if cannot parse.
+    """
+    try:
+        # Direct 4 numeric values
+        if isinstance(obj, (list, tuple)) and len(obj) == 4 and all(isinstance(v, (int, float)) for v in obj):
+            return [float(obj[0]), float(obj[1]), float(obj[2]), float(obj[3])]
+        # 8-number flattened polygon
+        if isinstance(obj, (list, tuple)) and len(obj) == 8 and all(isinstance(v, (int, float)) for v in obj):
+            xs = obj[0::2]
+            ys = obj[1::2]
+            return [float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))]
+        # List of points
+        if isinstance(obj, (list, tuple)) and all(isinstance(p, (list, tuple)) and len(p) >= 2 for p in obj):
+            xs = [p[0] for p in obj]
+            ys = [p[1] for p in obj]
+            if xs and ys:
+                return [float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))]
+        # Dict formats
+        if isinstance(obj, dict):
+            if all(k in obj for k in ("x1", "y1", "x2", "y2")):
+                return [float(obj['x1']), float(obj['y1']), float(obj['x2']), float(obj['y2'])]
+            if all(k in obj for k in ("left", "top", "right", "bottom")):
+                return [float(obj['left']), float(obj['top']), float(obj['right']), float(obj['bottom'])]
+            if 'points' in obj:
+                return _coerce_bbox(obj['points'])
+            if 'poly' in obj:
+                return _coerce_bbox(obj['poly'])
+            if 'polygon' in obj:
+                return _coerce_bbox(obj['polygon'])
+            if 'bbox' in obj:
+                return _coerce_bbox(obj['bbox'])
+            if 'box' in obj:
+                return _coerce_bbox(obj['box'])
+        return None
+    except Exception:
+        return None
 
 
 def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
@@ -145,7 +194,7 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
                     result = ocr_engine.ocr(arr)
         elapsed = (time.time() - t0) * 1000
 
-        # We'll collect structured line objects: {text, confidence, box}
+    # We'll collect structured line objects: {text, confidence, box, bbox}
         structured: List[Dict[str, Any]] = []
         lines_plain: List[str] = []
 
@@ -250,22 +299,12 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
                     structured.append(
                         {"text": t, "confidence": None, "box": None})
 
-        # Derive normalized axis-aligned bbox for each line if quadrilateral present
+        # Derive normalized axis-aligned bbox for each line using universal coercion
         for line in structured:
-            box = line.get('box')
-            if box and isinstance(box, (list, tuple)) and len(box) >= 4:
-                try:
-                    xs = [pt[0] for pt in box if isinstance(
-                        pt, (list, tuple)) and len(pt) >= 2]
-                    ys = [pt[1] for pt in box if isinstance(
-                        pt, (list, tuple)) and len(pt) >= 2]
-                    if xs and ys:
-                        x_min, x_max = min(xs), max(xs)
-                        y_min, y_max = min(ys), max(ys)
-                        line['bbox'] = [float(x_min), float(
-                            y_min), float(x_max), float(y_max)]
-                except Exception:
-                    pass
+            box_raw = line.get('box') or line.get('bbox')
+            bbox = _coerce_bbox(box_raw)
+            if bbox:
+                line['bbox'] = bbox
         full_text = '\n'.join(lines_plain)
         # Confidence stats
         conf_values = [c['confidence'] for c in structured if isinstance(
@@ -281,11 +320,16 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
         if os.getenv('OCR_LOG_COUNTS', '1').lower() in {'1', 'true', 'yes'}:
             logger.info(
                 f"OCR page: lines={len(structured)} chars={len(full_text)} time_ms={elapsed:.1f}")
-        raw_sample = None
-        if debug and not structured:
-            raw_sample = str(result)[:800]
-            logger.debug(f"RAW OCR RESULT SAMPLE (trim): {raw_sample}")
-        return {"full_text": full_text, "lines": structured, "raw": result if debug else None, "raw_sample": raw_sample, "stats": stats}
+        # Always include truncated raw snippet for debugging even if not in full debug
+        raw_str = None
+        try:
+            raw_str = str(result)
+        except Exception:
+            raw_str = None
+        raw_truncated = raw_str[:1200] if raw_str else None
+        if debug and not structured and raw_truncated:
+            logger.debug(f"RAW OCR RESULT SAMPLE (trim): {raw_truncated}")
+        return {"full_text": full_text, "lines": structured, "raw": result if debug else None, "raw_truncated": raw_truncated, "stats": stats}
     except Exception as e:
         logger.error(f"Error extracting text: {e}")
         return {"full_text": "", "lines": []}
@@ -305,44 +349,100 @@ def extract_tables_from_image(image: Image.Image, debug: bool = False) -> Dict[s
     """
     engine = get_table_engine()
     if not engine:
-        return {"tables": [], "raw": None}
+        return {"tables": [], "raw": None, "raw_truncated": None}
     try:
         arr = np.array(image.convert('RGB'))
         result = engine(arr)
         tables: List[Dict[str, Any]] = []
         total_cells = 0
-        if result:
+        layout_blocks: List[Dict[str, Any]] = []
+        if isinstance(result, list):
+            # First pass: direct table items
             for item in result:
-                if not (isinstance(item, dict) and item.get('type') == 'table'):
-                    continue
-                res_block = item.get('res') or {}
-                raw_cells = res_block.get('cells') or []
-                if not raw_cells and 'cell' in res_block:
-                    raw_cells = res_block['cell']
-                if not raw_cells and 'cells_list' in res_block:
-                    raw_cells = res_block['cells_list']
-                cells_out: List[Dict[str, Any]] = []
-                for c in raw_cells:
-                    if not isinstance(c, dict):
-                        continue
-                    txt = c.get('text') or c.get('cell_text') or ''
-                    bbox = c.get('bbox') or c.get(
-                        'box') or c.get('poly') or None
-                    cells_out.append({'text': txt, 'bbox': bbox})
-                total_cells += len(cells_out)
-                tables.append({'bbox': item.get('bbox', []),
-                              'cells': cells_out, 'cells_count': len(cells_out)})
+                if isinstance(item, dict) and item.get('type') == 'table':
+                    res_block = item.get('res') or {}
+                    raw_cells = res_block.get('cells') or []
+                    if not raw_cells and 'cell' in res_block:
+                        raw_cells = res_block['cell']
+                    if not raw_cells and 'cells_list' in res_block:
+                        raw_cells = res_block['cells_list']
+                    cells_out: List[Dict[str, Any]] = []
+                    for c in raw_cells:
+                        if not isinstance(c, dict):
+                            continue
+                        txt = c.get('text') or c.get('cell_text') or ''
+                        bbox = _coerce_bbox(c.get('bbox') or c.get(
+                            'box') or c.get('poly') or c.get('polygon'))
+                        cells_out.append({'text': txt, 'bbox': bbox})
+                    total_cells += len(cells_out)
+                    tables.append({'bbox': _coerce_bbox(item.get('bbox') or item.get('box') or item.get('poly') or item.get('polygon')) or [],
+                                   'cells': cells_out, 'cells_count': len(cells_out)})
+                elif isinstance(item, dict):
+                    layout_blocks.append(item)
+            # Fallback: inspect layout blocks for potential implicit tables (grid-like text)
+            if not tables and layout_blocks:
+                # Heuristic: group blocks that share similar y-ranges to form rows
+                candidate_lines = []
+                for b in layout_blocks:
+                    if b.get('type') in {'text', 'figure', 'layout'}:
+                        txt = b.get('res', {}).get('text') if isinstance(
+                            b.get('res'), dict) else None
+                        if isinstance(txt, str) and len(txt.strip()):
+                            bbox = _coerce_bbox(b.get('bbox') or b.get(
+                                'box') or b.get('poly') or b.get('polygon'))
+                            if bbox:
+                                candidate_lines.append(
+                                    {'text': txt, 'bbox': bbox})
+                # Simple row clustering by vertical overlap
+                rows: List[List[Dict[str, Any]]] = []
+                for line in sorted(candidate_lines, key=lambda x: x['bbox'][1]):
+                    placed = False
+                    for row in rows:
+                        # if vertical intersection > 40% treat as same row
+                        y_min = max(line['bbox'][1], min(
+                            c['bbox'][1] for c in row))
+                        y_max = min(line['bbox'][3], max(
+                            c['bbox'][3] for c in row))
+                        h = min(line['bbox'][3]-line['bbox'][1], max(c['bbox'][3]
+                                for c in row)-min(c['bbox'][1] for c in row))
+                        if h > 0 and (y_max - y_min) / h >= 0.4:
+                            row.append(line)
+                            placed = True
+                            break
+                    if not placed:
+                        rows.append([line])
+                # If we have multi-column style rows, treat as a single inferred table
+                if rows and sum(len(r) for r in rows) >= 6 and any(len(r) >= 2 for r in rows):
+                    # Flatten into cells
+                    all_cells = []
+                    x1 = min(min(c['bbox'][0] for c in r) for r in rows)
+                    y1 = min(min(c['bbox'][1] for c in r) for r in rows)
+                    x2 = max(max(c['bbox'][2] for c in r) for r in rows)
+                    y2 = max(max(c['bbox'][3] for c in r) for r in rows)
+                    for r in rows:
+                        for c in r:
+                            all_cells.append(
+                                {'text': c['text'], 'bbox': c['bbox']})
+                    tables.append({'bbox': [x1, y1, x2, y2], 'cells': all_cells, 'cells_count': len(
+                        all_cells), 'inferred': True})
+                    total_cells += len(all_cells)
         if (os.getenv('TABLE_DEBUG', '0').lower() in {'1', 'true', 'yes'}) or (os.getenv('OCR_DEBUG', '0').lower() in {'1', 'true', 'yes'}):
             logger.info(
                 f"table detection: raw_items={len(result) if isinstance(result, list) else 'n/a'} tables={len(tables)} total_cells={total_cells}")
         raw_summary = None
+        raw_str = None
+        try:
+            raw_str = str(result)
+        except Exception:
+            pass
+        raw_truncated = raw_str[:1200] if raw_str else None
         if isinstance(result, list):
             raw_summary = [r.get('type', 'unknown') if isinstance(
                 r, dict) else type(r).__name__ for r in result[:5]]
-        return {"tables": tables, "raw": result if debug else None, "raw_summary": raw_summary}
+        return {"tables": tables, "raw": result if debug else None, "raw_summary": raw_summary, "raw_truncated": raw_truncated}
     except Exception as e:
         logger.error(f"Error extracting tables: {e}")
-        return {"tables": [], "raw": None, "error": str(e)}
+        return {"tables": [], "raw": None, "raw_truncated": None, "error": str(e)}
 
 
 def process_image(image: Image.Image, page_index: int, lang: str, do_tables: bool, debug: bool) -> Dict[str, Any]:
@@ -377,9 +477,13 @@ def process_image(image: Image.Image, page_index: int, lang: str, do_tables: boo
             **({k: round(v, 6) for k, v in stats.items()} if stats else {})
         }
     }
+    # Always include truncated raw snippets for transparency
+    page["raw"] = {
+        "ocr_truncated": text_struct.get("raw_truncated"),
+        "tables_truncated": table_struct.get("raw_truncated")
+    }
     if debug:
         page["debug"] = {
-            "ocr_raw_sample": text_struct.get("raw_sample"),
             "tables_raw_count": len(table_struct.get("raw", []) if isinstance(table_struct.get("raw"), list) else []),
         }
     return page
