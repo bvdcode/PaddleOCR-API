@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="PaddleOCR API",
-              description="CPU-only OCR service", version="1.0.0")
+              description="CPU-only OCR service", version="1.1.2")
 
 # A pragmatic (not exhaustive) set of commonly used language codes that PaddleOCR accepts.
 # Full list in PaddleOCR docs is large; models will auto-download on first use for a given lang code.
@@ -240,6 +240,27 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
     try:
         ocr_engine = get_ocr(lang)
         arr = np.array(image.convert('RGB'))  # ensure RGB
+        # Optional downscale if image side exceeds limit (helps avoid internal max_side_limit aborts)
+        max_side_env = os.getenv('OCR_MAX_SIDE')
+        max_side = None
+        try:
+            if max_side_env:
+                max_side = int(max_side_env)
+        except Exception:
+            max_side = None
+        if max_side and max(arr.shape[0], arr.shape[1]) > max_side:
+            scale = max_side / float(max(arr.shape[0], arr.shape[1]))
+            if scale < 1.0:
+                new_w = int(arr.shape[1] * scale)
+                new_h = int(arr.shape[0] * scale)
+                try:
+                    from PIL import Image as _Img
+                    img_resized = Image.fromarray(arr).resize((new_w, new_h))
+                    arr = np.array(img_resized)
+                    logger.info(
+                        f"[downscale] resized page to {new_w}x{new_h} (scale={scale:.3f}) due to OCR_MAX_SIDE={max_side}")
+                except Exception as _re:
+                    logger.warning(f"[downscale] failed resizing: {_re}")
         import contextlib
         import time
         import io as _io
@@ -615,12 +636,22 @@ def process_image(image: Image.Image, page_index: int, lang: str, do_tables: boo
     """
     import time
     t0 = time.time()
-    text_struct = extract_text_from_image(image, lang)
+    try:
+        text_struct = extract_text_from_image(image, lang)
+    except Exception as e:
+        logger.error(
+            f"[page {page_index}] OCR fatal error: {type(e).__name__}: {e}")
+        text_struct = {"full_text": "", "lines": [], "error": str(e)}
     ocr_ms = (time.time() - t0)*1000
     t1 = time.time()
     table_struct: Dict[str, Any] = {"tables": []}
     if do_tables:
-        table_struct = extract_tables_from_image(image, debug)
+        try:
+            table_struct = extract_tables_from_image(image, debug)
+        except Exception as e:
+            logger.error(
+                f"[page {page_index}] table fatal error: {type(e).__name__}: {e}")
+            table_struct = {"tables": [], "error": str(e)}
     table_ms = (time.time() - t1)*1000 if do_tables else 0.0
     text_full = text_struct["full_text"]
     stats = text_struct.get('stats') or {}
@@ -699,6 +730,10 @@ def process_image(image: Image.Image, page_index: int, lang: str, do_tables: boo
             **({k: round(v, 6) for k, v in stats.items()} if stats else {})
         }
     }
+    if text_struct.get('error'):
+        page['text']['error'] = text_struct['error']
+    if table_struct.get('error'):
+        page.setdefault('tables_meta', {})['error'] = table_struct['error']
     # Secondary heuristic: if no tables detected but many numeric-like lines that appear columnar, attempt simple column grouping.
     if do_tables and not page['tables']:
         lines_with_bbox = [ln for ln in page['text']['lines'] if isinstance(
@@ -858,23 +893,33 @@ async def analyze(
     # (lang already validated and normalized above)
         pages_out = []
         progress: List[Dict[str, Any]] = []
+        failed_pages = 0
         for i, (img, idx) in enumerate(selected, 1):
             t_p0 = time.time()
-            page_obj = process_image(img, idx, lang_norm, tables, debug)
+            try:
+                page_obj = process_image(img, idx, lang_norm, tables, debug)
+            except Exception as e:
+                failed_pages += 1
+                logger.error(
+                    f"[pipeline] page {idx} unrecoverable error: {type(e).__name__}: {e}")
+                page_obj = {"index": idx, "text": {"full": "", "length": 0, "lines": [
+                ], "lines_count": 0, "error": str(e)}, "tables": [], "metrics": {}}
             pages_out.append(page_obj)
             progress.append({
                 "page": idx,
                 "position": i,
                 "total": len(selected),
-                "lines": page_obj['text']['lines_count'],
-                "chars": page_obj['text']['length'],
+                "lines": page_obj.get('text', {}).get('lines_count', 0),
+                "chars": page_obj.get('text', {}).get('length', 0),
                 "tables": len(page_obj.get('tables') or []),
-                "time_ms": round((time.time()-t_p0)*1000, 2)
+                "time_ms": round((time.time()-t_p0)*1000, 2),
+                "error": page_obj.get('text', {}).get('error') or page_obj.get('tables_meta', {}).get('error') if page_obj.get('tables_meta') else None
             })
         total_ms = (time.time()-t_start)*1000
         meta = {
             "pages_requested": len(selected),
             "total_ms": round(total_ms, 2),
+            "pages_failed": failed_pages,
         }
         response_obj = {"lang": lang_norm, "pages": pages_out,
                         "progress": progress, "meta": meta, "hash": doc_hash}
@@ -891,9 +936,9 @@ async def analyze(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error processing document: {e}")
+        logger.error(f"Error processing document: {type(e).__name__}: {e}")
         raise HTTPException(
-            status_code=500, detail=f"Error processing document: {e}")
+            status_code=500, detail=f"Document-level failure: {type(e).__name__}: {e}")
 
 if __name__ == '__main__':
     import uvicorn
