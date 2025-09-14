@@ -76,8 +76,8 @@ def get_table_engine():
         logger.info("PP-Structure not installed; table extraction disabled")
         _TABLE_ENGINE_ATTEMPTED = True
         return None
-    desired = dict(lang='ru', show_log=False,
-                   use_gpu=False, table=True, ocr=False)
+    # Request table module; do not force ocr=False (can break pipeline). Use 'en' to avoid extra language-specific downloads.
+    desired = dict(lang='en', show_log=False, use_gpu=False, table=True)
     filtered = _filter_kwargs(PPStructure, desired)
     try:
         engine = PPStructure(**filtered)
@@ -268,22 +268,28 @@ def extract_tables_from_image(image: Image.Image) -> List[Dict[str, Any]]:
         total_cells = 0
         if result:
             for item in result:
-                if isinstance(item, dict) and item.get('type') == 'table' and 'res' in item:
-                    res_block = item.get('res') or {}
-                    raw_cells = res_block.get('cells') or []
-                    cells_out: List[Dict[str, Any]] = []
-                    for c in raw_cells:
-                        if not isinstance(c, dict):
-                            continue
-                        txt = c.get('text') or c.get('cell_text') or ''
-                        bbox = c.get('bbox') or c.get('box') or None
-                        cells_out.append({'text': txt, 'bbox': bbox})
-                    total_cells += len(cells_out)
-                    tables.append({'bbox': item.get(
-                        'bbox', []), 'cells': cells_out, 'cells_count': len(cells_out)})
+                if not (isinstance(item, dict) and item.get('type') == 'table'):
+                    continue
+                res_block = item.get('res') or {}
+                raw_cells = res_block.get('cells') or []
+                if not raw_cells and 'cell' in res_block:
+                    raw_cells = res_block['cell']
+                if not raw_cells and 'cells_list' in res_block:
+                    raw_cells = res_block['cells_list']
+                cells_out: List[Dict[str, Any]] = []
+                for c in raw_cells:
+                    if not isinstance(c, dict):
+                        continue
+                    txt = c.get('text') or c.get('cell_text') or ''
+                    bbox = c.get('bbox') or c.get(
+                        'box') or c.get('poly') or None
+                    cells_out.append({'text': txt, 'bbox': bbox})
+                total_cells += len(cells_out)
+                tables.append({'bbox': item.get('bbox', []),
+                              'cells': cells_out, 'cells_count': len(cells_out)})
         if (os.getenv('TABLE_DEBUG', '0').lower() in {'1', 'true', 'yes'}) or (os.getenv('OCR_DEBUG', '0').lower() in {'1', 'true', 'yes'}):
             logger.info(
-                f"table detection: tables={len(tables)} total_cells={total_cells}")
+                f"table detection: raw_items={len(result) if isinstance(result, list) else 'n/a'} tables={len(tables)} total_cells={total_cells}")
         return tables
     except Exception as e:
         logger.error(f"Error extracting tables: {e}")
@@ -349,10 +355,10 @@ async def analyze(
             logger.info("[pipeline] page %d/%d start", i, len(selected))
             page_obj = process_image(img, idx, lang_norm, tables)
             pages_out.append(page_obj)
-            logger.info("[pipeline] page %d/%d processed lines=%s chars=%s time_ms=%.1f", i, len(selected),
+            logger.info("[pipeline] page %d/%d processed lines=%s chars=%s tables=%d time_ms=%.1f", i, len(selected),
                         len(page_obj['text'].get('lines', [])
                             ) if 'lines' in page_obj['text'] else 'n/a',
-                        page_obj['text'].get('length'), (time.time()-t_p0)*1000)
+                        page_obj['text'].get('length'), len(page_obj.get('tables') or []), (time.time()-t_p0)*1000)
         logger.info("[pipeline] done pages=%d total_ms=%.1f",
                     len(selected), (time.time()-t_start)*1000)
         if not return_text:
