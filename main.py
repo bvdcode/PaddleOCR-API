@@ -607,15 +607,74 @@ def process_image(image: Image.Image, page_index: int, lang: str, do_tables: boo
     table_ms = (time.time() - t1)*1000 if do_tables else 0.0
     text_full = text_struct["full_text"]
     stats = text_struct.get('stats') or {}
+    # Adapt geometry representation: convert box (polygon) -> list[{x,y}], bbox -> {x,y,w,h}
+
+    def poly_to_points(poly):
+        if not isinstance(poly, (list, tuple)):
+            return None
+        pts = []
+        for p in poly:
+            if isinstance(p, (list, tuple)) and len(p) >= 2 and all(isinstance(v, (int, float)) for v in p[:2]):
+                pts.append({'x': float(p[0]), 'y': float(p[1])})
+        return pts if pts else None
+
+    def bbox_to_obj(b):
+        if isinstance(b, (list, tuple)) and len(b) == 4 and all(isinstance(v, (int, float)) for v in b):
+            x1, y1, x2, y2 = b
+            return {'x1': float(x1), 'y1': float(y1), 'x2': float(x2), 'y2': float(y2)}
+        return None
+    # Deep copy/transform lines
+    transformed_lines: List[Dict[str, Any]] = []
+    for ln in text_struct['lines']:
+        if not isinstance(ln, dict):
+            continue
+        new_ln = dict(ln)
+        if 'box' in new_ln:
+            pts = poly_to_points(new_ln['box'])
+            if pts is not None:
+                new_ln['box'] = pts
+            else:
+                # drop invalid
+                new_ln.pop('box', None)
+        if 'bbox' in new_ln:
+            bb = bbox_to_obj(new_ln['bbox'])
+            if bb is not None:
+                new_ln['bbox'] = bb
+            else:
+                new_ln.pop('bbox', None)
+        transformed_lines.append(new_ln)
+    # Transform tables cells geometry similarly
+    transformed_tables = []
+    for tb in table_struct.get('tables', []) or []:
+        if not isinstance(tb, dict):
+            continue
+        new_tb = dict(tb)
+        # table bbox may be list of 4 numbers
+        if 'bbox' in new_tb:
+            bb = bbox_to_obj(new_tb['bbox'])
+            if bb is not None:
+                new_tb['bbox'] = bb
+        cells_t = []
+        for c in new_tb.get('cells', []) or []:
+            if not isinstance(c, dict):
+                continue
+            nc = dict(c)
+            if 'bbox' in nc:
+                bb = bbox_to_obj(nc['bbox'])
+                if bb is not None:
+                    nc['bbox'] = bb
+            cells_t.append(nc)
+        new_tb['cells'] = cells_t
+        transformed_tables.append(new_tb)
     page: Dict[str, Any] = {
         "index": page_index,
         "text": {
             "full": text_full,
             "length": len(text_full),
-            "lines": text_struct["lines"],
-            "lines_count": len(text_struct["lines"])
+            "lines": transformed_lines,
+            "lines_count": len(transformed_lines)
         },
-        "tables": table_struct.get("tables", []),
+        "tables": transformed_tables,
         "metrics": {
             "ocr_ms": round(ocr_ms, 2),
             "table_ms": round(table_ms, 2),
