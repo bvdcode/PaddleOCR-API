@@ -656,19 +656,11 @@ def process_image(image: Image.Image, page_index: int, lang: str, do_tables: boo
                 inferred_table = {'bbox': [x1, y1, x2, y2], 'cells': all_cells, 'cells_count': len(
                     all_cells), 'inferred_from': 'ocr_lines'}
                 page['tables'].append(inferred_table)
-    # Always include truncated raw snippets for transparency
-    page["raw"] = {
-        "ocr_truncated": text_struct.get("raw_truncated"),
-        "tables_truncated": table_struct.get("raw_truncated")
+    page["debug"] = {
+        "ocr_raw_present": bool(text_struct.get("raw")),
+        "tables_raw_present": bool(table_struct.get("raw")),
+        "tables_raw_count": len(table_struct.get("raw", []) if isinstance(table_struct.get("raw"), list) else []),
     }
-    page["raw_full"] = {
-        "ocr": text_struct.get("raw_full"),
-        "tables": table_struct.get("raw_full")
-    }
-    if debug:
-        page["debug"] = {
-            "tables_raw_count": len(table_struct.get("raw", []) if isinstance(table_struct.get("raw"), list) else []),
-        }
     return page
 
 
