@@ -163,6 +163,52 @@ def _coerce_bbox(obj: Any) -> Optional[List[float]]:
         return None
 
 
+def _sanitize_raw(obj: Any, depth: int = 0, max_depth: int = 4, max_list: int = 60) -> Any:
+    """Best-effort conversion of Paddle raw output to JSON-safe structure.
+
+    Truncates deeply nested / very long lists; converts numpy arrays to:
+      {"shape": [...], "dtype": str, "sample": "truncated str(...)"}
+    for large arrays, or full tolist() if tiny (<200 scalar values).
+    """
+    try:
+        import numpy as _np
+        if depth > max_depth:
+            return '...'
+        if isinstance(obj, (str, int, float, bool)) or obj is None:
+            return obj
+        if isinstance(obj, (list, tuple)):
+            out = []
+            for i, v in enumerate(obj):
+                if i >= max_list:
+                    out.append('...')
+                    break
+                out.append(_sanitize_raw(v, depth+1, max_depth, max_list))
+            return out
+        if isinstance(obj, dict):
+            out: Dict[str, Any] = {}
+            for k, v in list(obj.items())[:200]:  # cap huge dicts
+                out[str(k)] = _sanitize_raw(v, depth+1, max_depth, max_list)
+            if len(obj) > 200:
+                out['...extra_keys'] = len(obj) - 200
+            return out
+        if hasattr(obj, 'tolist') and isinstance(obj, _np.ndarray):
+            size = obj.size
+            if size <= 200:
+                return obj.tolist()
+            return {
+                'shape': list(obj.shape),
+                'dtype': str(obj.dtype),
+                'sample': str(obj.reshape(-1)[:16].tolist())
+            }
+        # Fallback generic string repr truncated
+        rep = str(obj)
+        if len(rep) > 300:
+            rep = rep[:300] + '...'
+        return rep
+    except Exception as e:
+        return f"<sanitize_error: {e}>"
+
+
 def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
     """Run legacy .ocr() and extract text robustly.
 
@@ -242,16 +288,38 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
                         structured.append(
                             {"text": text_val, "confidence": conf_val, "box": box})
 
-        # Secondary: list of dicts with 'text'
+        # Secondary: list of dicts
         if not structured and isinstance(result, list):
-            for item in result:
-                if isinstance(item, dict) and 'text' in item and isinstance(item['text'], str):
-                    structured.append({
-                        "text": item['text'],
-                        "confidence": item.get('confidence') or item.get('score'),
-                        "box": item.get('box') or item.get('bbox')
-                    })
-                    lines_plain.append(item['text'])
+            # Case: each element dict may have its own dt_polys/rec_texts
+            if all(isinstance(item, dict) for item in result):
+                collected_any = False
+                for item in result:
+                    if all(k in item for k in ('dt_polys', 'rec_texts')):
+                        polys = item.get('dt_polys') or []
+                        texts = item.get('rec_texts') or []
+                        scores = item.get('rec_scores') or []
+                        for i, txt in enumerate(texts):
+                            if not isinstance(txt, str) or not txt.strip():
+                                continue
+                            poly = polys[i] if i < len(polys) else None
+                            if hasattr(poly, 'tolist'):
+                                poly = poly.tolist()
+                            score = None
+                            if i < len(scores) and isinstance(scores[i], (int, float)):
+                                score = float(scores[i])
+                            structured.append(
+                                {'text': txt, 'confidence': score, 'box': poly})
+                            lines_plain.append(txt)
+                            collected_any = True
+                if not collected_any:
+                    for item in result:
+                        if isinstance(item, dict) and 'text' in item and isinstance(item['text'], str):
+                            structured.append({
+                                "text": item['text'],
+                                "confidence": item.get('confidence') or item.get('score'),
+                                "box": item.get('box') or item.get('bbox')
+                            })
+                            lines_plain.append(item['text'])
 
         # Tertiary: dict with 'data' or nested lists or modern keys (dt_polys/rec_texts)
         if not structured and isinstance(result, dict):
@@ -288,7 +356,7 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
                             })
                             lines_plain.append(item['text'])
 
-        # Deep recursive fallback (guarded) if still empty
+        # Deep recursive fallback (guarded) if still empty (no geometry yet)
         deep_enabled = os.getenv('OCR_DEEP_PARSE', '1').lower() in {
             '1', 'true', 'yes'}
         if not structured and deep_enabled:
@@ -330,6 +398,55 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
             # Ensure no numpy arrays leak (JSON safe)
             if isinstance(line.get('box'), np.ndarray):
                 line['box'] = line['box'].tolist()
+
+        # Manual detector + recognizer fallback if still no boxes at all
+        if structured and not any('bbox' in ln for ln in structured):
+            try:
+                det_model = getattr(ocr_engine, 'text_detector', None)
+                rec_model = getattr(ocr_engine, 'text_recognizer', None)
+                if det_model and rec_model:
+                    det_res = det_model(arr)
+                    # det_res expected: list of polys
+                    polys = det_res if isinstance(det_res, list) else []
+                    rec_inputs = []
+                    boxes_norm = []
+                    from PIL import Image as _Img
+                    h, w = arr.shape[0], arr.shape[1]
+                    for poly in polys:
+                        if hasattr(poly, 'tolist'):
+                            poly_l = poly.tolist()
+                        else:
+                            poly_l = poly
+                        bbox = _coerce_bbox(poly_l)
+                        if not bbox:
+                            continue
+                        x1, y1, x2, y2 = [int(max(0, v)) for v in bbox]
+                        x2 = min(w, x2)
+                        y2 = min(h, y2)
+                        if x2 - x1 < 2 or y2 - y1 < 2:
+                            continue
+                        crop = arr[y1:y2, x1:x2]
+                        rec_inputs.append(crop)
+                        boxes_norm.append(poly_l)
+                    if rec_inputs:
+                        rec_res = rec_model(rec_inputs)
+                        # rec_res: list of (text, score)
+                        new_struct = []
+                        for (txt, score), poly in zip(rec_res, boxes_norm):
+                            if not isinstance(txt, str) or not txt.strip():
+                                continue
+                            new_struct.append({'text': txt, 'confidence': float(
+                                score) if isinstance(score, (int, float)) else None, 'box': poly})
+                        if new_struct:
+                            structured = new_struct
+                            lines_plain = [ln['text'] for ln in structured]
+                            for ln in structured:
+                                bbox = _coerce_bbox(ln.get('box'))
+                                if bbox:
+                                    ln['bbox'] = bbox
+            except Exception as _e:
+                logger.info(
+                    f"manual detector-recognizer fallback failed: {_e}")
         full_text = '\n'.join(lines_plain)
         # Confidence stats
         conf_values = [c['confidence'] for c in structured if isinstance(
@@ -354,7 +471,8 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
         raw_truncated = raw_str[:1200] if raw_str else None
         if debug and not structured and raw_truncated:
             logger.debug(f"RAW OCR RESULT SAMPLE (trim): {raw_truncated}")
-        return {"full_text": full_text, "lines": structured, "raw": result if debug else None, "raw_truncated": raw_truncated, "stats": stats}
+        sanitized = _sanitize_raw(result)
+        return {"full_text": full_text, "lines": structured, "raw": result if debug else None, "raw_truncated": raw_truncated, "raw_full": sanitized, "stats": stats}
     except Exception as e:
         logger.error(f"Error extracting text: {e}")
         return {"full_text": "", "lines": []}
@@ -464,7 +582,8 @@ def extract_tables_from_image(image: Image.Image, debug: bool = False) -> Dict[s
         if isinstance(result, list):
             raw_summary = [r.get('type', 'unknown') if isinstance(
                 r, dict) else type(r).__name__ for r in result[:5]]
-        return {"tables": tables, "raw": result if debug else None, "raw_summary": raw_summary, "raw_truncated": raw_truncated}
+        sanitized = _sanitize_raw(result)
+        return {"tables": tables, "raw": result if debug else None, "raw_summary": raw_summary, "raw_truncated": raw_truncated, "raw_full": sanitized}
     except Exception as e:
         logger.error(f"Error extracting tables: {e}")
         return {"tables": [], "raw": None, "raw_truncated": None, "error": str(e)}
@@ -541,6 +660,10 @@ def process_image(image: Image.Image, page_index: int, lang: str, do_tables: boo
     page["raw"] = {
         "ocr_truncated": text_struct.get("raw_truncated"),
         "tables_truncated": table_struct.get("raw_truncated")
+    }
+    page["raw_full"] = {
+        "ocr": text_struct.get("raw_full"),
+        "tables": table_struct.get("raw_full")
     }
     if debug:
         page["debug"] = {
