@@ -245,6 +245,13 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
 
 
 def extract_tables_from_image(image: Image.Image) -> List[Dict[str, Any]]:
+    """Extract tables using PP-Structure (if enabled) but remove any HTML output.
+
+    We purposely strip HTML because user requested no HTML in API results.
+    Returned structure per table:
+      { 'bbox': [...], 'rows': [] }
+    (rows left as an empty list placeholder for potential future structured cells)
+    """
     engine = get_table_engine()
     if not engine:
         return []
@@ -257,34 +264,24 @@ def extract_tables_from_image(image: Image.Image) -> List[Dict[str, Any]]:
         if result:
             for item in result:
                 if item.get('type') == 'table' and 'res' in item:
-                    table_data = item['res']
-                    rows = []
-                    if 'html' in table_data:
-                        rows.append({'html': table_data['html']})
-                    tables.append({'rows': rows, 'bbox': item.get('bbox', [])})
+                    # We ignore any 'html' field intentionally.
+                    tables.append({'rows': [], 'bbox': item.get('bbox', [])})
         return tables
     except Exception as e:
         logger.error(f"Error extracting tables: {e}")
         return []
 
 
-def process_image(image: Image.Image, page_index: int, lang: str, return_html: bool = False) -> Dict[str, Any]:
+def process_image(image: Image.Image, page_index: int, lang: str) -> Dict[str, Any]:
+    """Run OCR + (optional) table detection for a single page.
+
+    HTML output was removed per user request; only structured JSON is returned.
+    """
     text_struct = extract_text_from_image(image, lang)
     text_full = text_struct["full_text"]
     tables = extract_tables_from_image(image)
     page: Dict[str, Any] = {"index": page_index,
                             "text": {"full": text_full, "length": len(text_full), "lines": text_struct["lines"]}, "tables": tables}
-    if return_html:
-        html = f"<div class='page' data-page='{page_index}'>"
-        html += f"<div class='text'>{text_full.replace(chr(10), '<br>')}</div>"
-        for i, table in enumerate(tables):
-            html += f"<div class='table' data-table='{i}'>"
-            for row in table['rows']:
-                if 'html' in row:
-                    html += row['html']
-            html += "</div>"
-        html += "</div>"
-        page['html'] = html
     return page
 
 
@@ -299,7 +296,6 @@ async def analyze(
     dpi: int = Form(350),
     pages: str = Form(""),
     lang: str = Form("ru"),
-    return_html: bool = Form(False),
     return_text: bool = Form(True),
     return_raw: bool = Form(False)
 ):
@@ -332,7 +328,7 @@ async def analyze(
         for i, (img, idx) in enumerate(selected, 1):
             t_p0 = time.time()
             logger.info("[pipeline] page %d/%d start", i, len(selected))
-            page_obj = process_image(img, idx, lang_norm, return_html)
+            page_obj = process_image(img, idx, lang_norm)
             pages_out.append(page_obj)
             logger.info("[pipeline] page %d/%d processed lines=%s chars=%s time_ms=%.1f", i, len(selected),
                         len(page_obj['text'].get('lines', [])
