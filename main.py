@@ -149,12 +149,11 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
         structured: List[Dict[str, Any]] = []
         lines_plain: List[str] = []
 
-        # Primary (legacy) pattern
+        # Pattern A: nested list (older format: [ [ [box,(text,conf)], ... ] ])
         if isinstance(result, list) and result:
             first = result[0]
-            if isinstance(first, list):
+            if isinstance(first, list) and all(isinstance(e, (list, tuple)) for e in first):
                 for entry in first:
-                    # legacy entry: [box, (text, conf)]
                     if isinstance(entry, (list, tuple)) and len(entry) >= 2:
                         box = entry[0]
                         txt_part = entry[1]
@@ -171,11 +170,28 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
                             text_val = txt_part
                         if text_val:
                             lines_plain.append(text_val)
-                            structured.append({
-                                "text": text_val,
-                                "confidence": conf_val,
-                                "box": box if isinstance(box, (list, tuple)) else None
-                            })
+                            structured.append(
+                                {"text": text_val, "confidence": conf_val, "box": box})
+            # Pattern B: flat list directly of entries [ [box,(text,conf)], ... ]
+            elif all(isinstance(entry, (list, tuple)) and len(entry) >= 2 and isinstance(entry[0], (list, tuple)) for entry in result):
+                for entry in result:
+                    box = entry[0]
+                    txt_part = entry[1]
+                    text_val: Optional[str] = None
+                    conf_val: Optional[float] = None
+                    if isinstance(txt_part, (list, tuple)) and txt_part:
+                        text_val = str(txt_part[0])
+                        if len(txt_part) > 1:
+                            try:
+                                conf_val = float(txt_part[1])
+                            except Exception:
+                                conf_val = None
+                    elif isinstance(txt_part, str):
+                        text_val = txt_part
+                    if text_val:
+                        lines_plain.append(text_val)
+                        structured.append(
+                            {"text": text_val, "confidence": conf_val, "box": box})
 
         # Secondary: list of dicts with 'text'
         if not structured and isinstance(result, list):
@@ -292,7 +308,11 @@ def extract_tables_from_image(image: Image.Image, debug: bool = False) -> Dict[s
         if (os.getenv('TABLE_DEBUG', '0').lower() in {'1', 'true', 'yes'}) or (os.getenv('OCR_DEBUG', '0').lower() in {'1', 'true', 'yes'}):
             logger.info(
                 f"table detection: raw_items={len(result) if isinstance(result, list) else 'n/a'} tables={len(tables)} total_cells={total_cells}")
-        return {"tables": tables, "raw": result if debug else None}
+        raw_summary = None
+        if isinstance(result, list):
+            raw_summary = [r.get('type', 'unknown') if isinstance(
+                r, dict) else type(r).__name__ for r in result[:5]]
+        return {"tables": tables, "raw": result if debug else None, "raw_summary": raw_summary}
     except Exception as e:
         logger.error(f"Error extracting tables: {e}")
         return {"tables": [], "raw": None, "error": str(e)}
