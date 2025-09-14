@@ -9,6 +9,8 @@ from paddleocr import PaddleOCR
 import inspect
 import logging
 import numpy as np
+import hashlib
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -688,6 +690,30 @@ async def analyze(
             raise HTTPException(
                 status_code=400, detail='Unsupported file type. Only PDF, PNG, JPG.')
         data = await file.read()
+        # Compute cache hash (depends only on file bytes + lang + tables + dpi + pages selection string)
+        h = hashlib.sha256()
+        h.update(data)
+        meta_part = f"|lang={lang}|tables={tables}|dpi={dpi}|pages={pages}".encode(
+            'utf-8')
+        h.update(meta_part)
+        doc_hash = h.hexdigest()
+        cache_dir = os.path.join(os.getcwd(), 'cache')
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except Exception:
+            pass
+        cache_path = os.path.join(cache_dir, f"{doc_hash}.json")
+        if os.path.isfile(cache_path):
+            try:
+                with open(cache_path, 'r', encoding='utf-8') as cf:
+                    cached = json.load(cf)
+                # Quick sanity: ensure minimal keys exist
+                if isinstance(cached, dict) and 'pages' in cached and 'meta' in cached:
+                    logger.info(
+                        f"[cache] hit hash={doc_hash} path={cache_path}")
+                    return JSONResponse(content=cached)
+            except Exception as e:
+                logger.warning(f"[cache] read failed will recompute: {e}")
         logger.info("[pipeline] file size=%d bytes", len(data))
         if 'pdf' in ct:
             t_pdf0 = time.time()
@@ -723,7 +749,18 @@ async def analyze(
             "pages_requested": len(selected),
             "total_ms": round(total_ms, 2),
         }
-        return JSONResponse(content={"lang": lang_norm, "pages": pages_out, "progress": progress, "meta": meta})
+        response_obj = {"lang": lang_norm, "pages": pages_out,
+                        "progress": progress, "meta": meta, "hash": doc_hash}
+        # Store in cache (best-effort)
+        try:
+            with open(cache_path, 'w', encoding='utf-8') as cf:
+                json.dump(response_obj, cf, ensure_ascii=False,
+                          separators=(',', ':'), indent=None)
+            logger.info(
+                f"[cache] stored hash={doc_hash} bytes={os.path.getsize(cache_path)}")
+        except Exception as e:
+            logger.warning(f"[cache] write failed: {e}")
+        return JSONResponse(content=response_obj)
     except HTTPException:
         raise
     except Exception as e:
