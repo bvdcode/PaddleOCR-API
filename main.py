@@ -26,27 +26,30 @@ COMMON_LANGS = {
     'my', 'th', 'mr', 'ne', 'uz', 'kk', 'mn', 'he'  # etc.
 }
 
-# Optional restriction: if you want to limit which languages can be requested, set env OCR_LANG_WHITELIST="en,ru,fr".
+
+def _filter_kwargs(cls, desired: Dict[str, Any]) -> Dict[str, Any]:
+    """Return only kwargs accepted by cls.__init__ (best-effort).
+
+    This avoids passing unexpected parameters if Paddle updates signatures.
+    """
+    try:
+        sig = inspect.signature(cls.__init__)
+        allowed = set(sig.parameters.keys())
+        return {k: v for k, v in desired.items() if k in allowed}
+    except Exception:
+        return desired
 
 
 def _get_lang_whitelist() -> Optional[set]:
-    wl = os.getenv('OCR_LANG_WHITELIST')
-    if not wl:
+    """Parse OCR_LANG_WHITELIST env var into a set or return None if unset.
+
+    Accepts comma-separated list; trims whitespace; ignores empties.
+    """
+    raw = os.getenv('OCR_LANG_WHITELIST')
+    if not raw:
         return None
-    return {x.strip().lower() for x in wl.split(',') if x.strip()}
-
-
-def _filter_kwargs(callable_obj, desired: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        sig = inspect.signature(callable_obj)
-        accepted = {k: v for k, v in desired.items() if k in sig.parameters}
-        dropped = set(desired) - set(accepted)
-        if dropped:
-            logger.info(
-                f"Dropped unsupported args for {callable_obj.__name__}: {dropped}")
-        return accepted
-    except Exception:
-        return desired
+    parts = [p.strip().lower() for p in raw.split(',') if p.strip()]
+    return set(parts) if parts else None
 
 
 _OCR_CACHE: Dict[str, PaddleOCR] = {}
@@ -853,30 +856,13 @@ async def analyze(
         data = await file.read()
         # Validate & normalize language (required; no fallback default)
         lang_norm = _validate_lang(lang)
-
-        # Base document hash (independent of requested page subset). Not including pages param here for reusability.
-        base_h = hashlib.sha256()
-        base_h.update(data)
-        base_meta_part = f"|lang={lang_norm}|tables={tables}|dpi={dpi}".encode(
-            'utf-8')
-        base_h.update(base_meta_part)
-        base_hash = base_h.hexdigest()
-        cache_dir = os.path.join(os.getcwd(), 'cache', base_hash)
+        # Simple file-level hash (raw bytes only) for cache identity
+        file_hash = hashlib.sha256(data).hexdigest()
+        cache_dir = os.path.join(os.getcwd(), 'cache')
         try:
             os.makedirs(cache_dir, exist_ok=True)
         except Exception:
             pass
-        # Manifest file summarizing already processed pages
-        manifest_path = os.path.join(cache_dir, 'manifest.json')
-        manifest = {"base_hash": base_hash, "pages": {}, "version": "1"}
-        if os.path.isfile(manifest_path):
-            try:
-                with open(manifest_path, 'r', encoding='utf-8') as mf:
-                    mdata = json.load(mf)
-                    if isinstance(mdata, dict) and mdata.get('base_hash') == base_hash:
-                        manifest = mdata
-            except Exception as e:
-                logger.warning(f"[cache] manifest load failed: {e}")
         logger.info("[pipeline] file size=%d bytes", len(data))
         if 'pdf' in ct:
             t_pdf0 = time.time()
@@ -896,45 +882,32 @@ async def analyze(
         total_pages_selected = len(selected)
         for i, (img, idx) in enumerate(selected, 1):
             t_p0 = time.time()
-            page_key = str(idx)
-            page_cache_name = f"page_{idx}.json"  # per-page snapshot
-            page_cache_path = os.path.join(cache_dir, page_cache_name)
+            # Flat per-page cache file: {filehash}_{dpi}_{page}_{lang}.json
+            cache_filename = f"{file_hash}_{dpi}_{idx}_{lang_norm}.json"
+            page_cache_path = os.path.join(cache_dir, cache_filename)
             page_obj: Dict[str, Any]
             cache_hit = False
             if os.path.isfile(page_cache_path):
                 try:
                     with open(page_cache_path, 'r', encoding='utf-8') as pf:
                         cached_page = json.load(pf)
-                    # minimal validation
                     if isinstance(cached_page, dict) and cached_page.get('index') == idx:
                         page_obj = cached_page
                         cache_hit = True
-                        logger.info(
-                            f"[cache:page] hit base={base_hash} page={idx}")
+                        logger.info(f"[cache:page] hit file={cache_filename}")
                     else:
-                        page_obj = process_image(
-                            img, idx, lang_norm, tables, debug)
+                        page_obj = process_image(img, idx, lang_norm, tables, debug)
                 except Exception as e:
-                    logger.warning(
-                        f"[cache:page] read failed page={idx}: {e}; recompute")
-                    page_obj = process_image(
-                        img, idx, lang_norm, tables, debug)
+                    logger.warning(f"[cache:page] read failed {cache_filename}: {e}; recompute")
+                    page_obj = process_image(img, idx, lang_norm, tables, debug)
             else:
                 page_obj = process_image(img, idx, lang_norm, tables, debug)
-                # Write page cache
+                # Persist page
                 try:
                     with open(page_cache_path, 'w', encoding='utf-8') as pf:
-                        json.dump(page_obj, pf, ensure_ascii=False,
-                                  separators=(',', ':'), indent=None)
+                        json.dump(page_obj, pf, ensure_ascii=False, separators=(',', ':'), indent=None)
                 except Exception as e:
-                    logger.warning(
-                        f"[cache:page] write failed page={idx}: {e}")
-            # Update manifest entry
-            manifest['pages'][page_key] = {
-                'cache_file': page_cache_name,
-                'cached': True,
-                'error': page_obj.get('text', {}).get('error') or page_obj.get('tables_meta', {}).get('error') if page_obj.get('tables_meta') else None
-            }
+                    logger.warning(f"[cache:page] write failed {cache_filename}: {e}")
             if page_obj.get('text', {}).get('error'):
                 failed_pages += 1
             pages_out.append(page_obj)
@@ -947,24 +920,25 @@ async def analyze(
                 'tables': len(page_obj.get('tables') or []),
                 'time_ms': round((time.time() - t_p0)*1000, 2),
                 'cache': cache_hit,
-                'error': page_obj.get('text', {}).get('error') or page_obj.get('tables_meta', {}).get('error') if page_obj.get('tables_meta') else None
+                'error': page_obj.get('text', {}).get('error') or page_obj.get('tables_meta', {}).get('error') if page_obj.get('tables_meta') else None,
+                'cache_file': cache_filename
             })
-        # Persist manifest
-        try:
-            with open(manifest_path, 'w', encoding='utf-8') as mf:
-                json.dump(manifest, mf, ensure_ascii=False,
-                          separators=(',', ':'), indent=None)
-        except Exception as e:
-            logger.warning(f"[cache] manifest write failed: {e}")
         total_ms = (time.time()-t_start)*1000
         meta = {
             "pages_requested": len(selected),
             "total_ms": round(total_ms, 2),
             "pages_failed": failed_pages,
+            "cache_pattern": "{filehash}_{dpi}_{page}_{lang}.json"
         }
-        response_obj = {"lang": lang_norm, "pages": pages_out,
-                        "progress": progress, "meta": meta, "hash": base_hash}
-        # No whole-document cache write now; per-page + manifest only
+        response_obj = {
+            "lang": lang_norm,
+            "pages": pages_out,
+            "progress": progress,
+            "meta": meta,
+            "hash": file_hash,
+            "dpi": dpi,
+            "tables": tables
+        }
         return JSONResponse(content=response_obj)
     except HTTPException:
         raise
