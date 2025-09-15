@@ -855,9 +855,12 @@ async def analyze(
         lang_norm = _validate_lang(lang)
 
         # Base document hash (independent of requested page subset). Not including pages param here for reusability.
-        base_h = hashlib.sha256(); base_h.update(data)
-        base_meta_part = f"|lang={lang_norm}|tables={tables}|dpi={dpi}".encode('utf-8')
-        base_h.update(base_meta_part); base_hash = base_h.hexdigest()
+        base_h = hashlib.sha256()
+        base_h.update(data)
+        base_meta_part = f"|lang={lang_norm}|tables={tables}|dpi={dpi}".encode(
+            'utf-8')
+        base_h.update(base_meta_part)
+        base_hash = base_h.hexdigest()
         cache_dir = os.path.join(os.getcwd(), 'cache', base_hash)
         try:
             os.makedirs(cache_dir, exist_ok=True)
@@ -906,20 +909,26 @@ async def analyze(
                     if isinstance(cached_page, dict) and cached_page.get('index') == idx:
                         page_obj = cached_page
                         cache_hit = True
-                        logger.info(f"[cache:page] hit base={base_hash} page={idx}")
+                        logger.info(
+                            f"[cache:page] hit base={base_hash} page={idx}")
                     else:
-                        page_obj = process_image(img, idx, lang_norm, tables, debug)
+                        page_obj = process_image(
+                            img, idx, lang_norm, tables, debug)
                 except Exception as e:
-                    logger.warning(f"[cache:page] read failed page={idx}: {e}; recompute")
-                    page_obj = process_image(img, idx, lang_norm, tables, debug)
+                    logger.warning(
+                        f"[cache:page] read failed page={idx}: {e}; recompute")
+                    page_obj = process_image(
+                        img, idx, lang_norm, tables, debug)
             else:
                 page_obj = process_image(img, idx, lang_norm, tables, debug)
                 # Write page cache
                 try:
                     with open(page_cache_path, 'w', encoding='utf-8') as pf:
-                        json.dump(page_obj, pf, ensure_ascii=False, separators=(',', ':'), indent=None)
+                        json.dump(page_obj, pf, ensure_ascii=False,
+                                  separators=(',', ':'), indent=None)
                 except Exception as e:
-                    logger.warning(f"[cache:page] write failed page={idx}: {e}")
+                    logger.warning(
+                        f"[cache:page] write failed page={idx}: {e}")
             # Update manifest entry
             manifest['pages'][page_key] = {
                 'cache_file': page_cache_name,
@@ -943,7 +952,8 @@ async def analyze(
         # Persist manifest
         try:
             with open(manifest_path, 'w', encoding='utf-8') as mf:
-                json.dump(manifest, mf, ensure_ascii=False, separators=(',', ':'), indent=None)
+                json.dump(manifest, mf, ensure_ascii=False,
+                          separators=(',', ':'), indent=None)
         except Exception as e:
             logger.warning(f"[cache] manifest write failed: {e}")
         total_ms = (time.time()-t_start)*1000
