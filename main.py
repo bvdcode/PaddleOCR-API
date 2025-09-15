@@ -854,30 +854,26 @@ async def analyze(
         # Validate & normalize language (required; no fallback default)
         lang_norm = _validate_lang(lang)
 
-        # Compute cache hash (depends on file bytes + normalized lang + tables + dpi + pages selection string)
-        h = hashlib.sha256()
-        h.update(data)
-        meta_part = f"|lang={lang_norm}|tables={tables}|dpi={dpi}|pages={pages}".encode(
-            'utf-8')
-        h.update(meta_part)
-        doc_hash = h.hexdigest()
-        cache_dir = os.path.join(os.getcwd(), 'cache')
+        # Base document hash (independent of requested page subset). Not including pages param here for reusability.
+        base_h = hashlib.sha256(); base_h.update(data)
+        base_meta_part = f"|lang={lang_norm}|tables={tables}|dpi={dpi}".encode('utf-8')
+        base_h.update(base_meta_part); base_hash = base_h.hexdigest()
+        cache_dir = os.path.join(os.getcwd(), 'cache', base_hash)
         try:
             os.makedirs(cache_dir, exist_ok=True)
         except Exception:
             pass
-        cache_path = os.path.join(cache_dir, f"{doc_hash}.json")
-        if os.path.isfile(cache_path):
+        # Manifest file summarizing already processed pages
+        manifest_path = os.path.join(cache_dir, 'manifest.json')
+        manifest = {"base_hash": base_hash, "pages": {}, "version": "1"}
+        if os.path.isfile(manifest_path):
             try:
-                with open(cache_path, 'r', encoding='utf-8') as cf:
-                    cached = json.load(cf)
-                # Quick sanity: ensure minimal keys exist
-                if isinstance(cached, dict) and 'pages' in cached and 'meta' in cached:
-                    logger.info(
-                        f"[cache] hit hash={doc_hash} path={cache_path}")
-                    return JSONResponse(content=cached)
+                with open(manifest_path, 'r', encoding='utf-8') as mf:
+                    mdata = json.load(mf)
+                    if isinstance(mdata, dict) and mdata.get('base_hash') == base_hash:
+                        manifest = mdata
             except Exception as e:
-                logger.warning(f"[cache] read failed will recompute: {e}")
+                logger.warning(f"[cache] manifest load failed: {e}")
         logger.info("[pipeline] file size=%d bytes", len(data))
         if 'pdf' in ct:
             t_pdf0 = time.time()
@@ -891,30 +887,65 @@ async def analyze(
             img = Image.open(io.BytesIO(data))
             selected = [(img, 1)]
     # (lang already validated and normalized above)
-        pages_out = []
+        pages_out: List[Dict[str, Any]] = []
         progress: List[Dict[str, Any]] = []
         failed_pages = 0
+        total_pages_selected = len(selected)
         for i, (img, idx) in enumerate(selected, 1):
             t_p0 = time.time()
-            try:
+            page_key = str(idx)
+            page_cache_name = f"page_{idx}.json"  # per-page snapshot
+            page_cache_path = os.path.join(cache_dir, page_cache_name)
+            page_obj: Dict[str, Any]
+            cache_hit = False
+            if os.path.isfile(page_cache_path):
+                try:
+                    with open(page_cache_path, 'r', encoding='utf-8') as pf:
+                        cached_page = json.load(pf)
+                    # minimal validation
+                    if isinstance(cached_page, dict) and cached_page.get('index') == idx:
+                        page_obj = cached_page
+                        cache_hit = True
+                        logger.info(f"[cache:page] hit base={base_hash} page={idx}")
+                    else:
+                        page_obj = process_image(img, idx, lang_norm, tables, debug)
+                except Exception as e:
+                    logger.warning(f"[cache:page] read failed page={idx}: {e}; recompute")
+                    page_obj = process_image(img, idx, lang_norm, tables, debug)
+            else:
                 page_obj = process_image(img, idx, lang_norm, tables, debug)
-            except Exception as e:
+                # Write page cache
+                try:
+                    with open(page_cache_path, 'w', encoding='utf-8') as pf:
+                        json.dump(page_obj, pf, ensure_ascii=False, separators=(',', ':'), indent=None)
+                except Exception as e:
+                    logger.warning(f"[cache:page] write failed page={idx}: {e}")
+            # Update manifest entry
+            manifest['pages'][page_key] = {
+                'cache_file': page_cache_name,
+                'cached': True,
+                'error': page_obj.get('text', {}).get('error') or page_obj.get('tables_meta', {}).get('error') if page_obj.get('tables_meta') else None
+            }
+            if page_obj.get('text', {}).get('error'):
                 failed_pages += 1
-                logger.error(
-                    f"[pipeline] page {idx} unrecoverable error: {type(e).__name__}: {e}")
-                page_obj = {"index": idx, "text": {"full": "", "length": 0, "lines": [
-                ], "lines_count": 0, "error": str(e)}, "tables": [], "metrics": {}}
             pages_out.append(page_obj)
             progress.append({
-                "page": idx,
-                "position": i,
-                "total": len(selected),
-                "lines": page_obj.get('text', {}).get('lines_count', 0),
-                "chars": page_obj.get('text', {}).get('length', 0),
-                "tables": len(page_obj.get('tables') or []),
-                "time_ms": round((time.time()-t_p0)*1000, 2),
-                "error": page_obj.get('text', {}).get('error') or page_obj.get('tables_meta', {}).get('error') if page_obj.get('tables_meta') else None
+                'page': idx,
+                'position': i,
+                'total': total_pages_selected,
+                'lines': page_obj.get('text', {}).get('lines_count', 0),
+                'chars': page_obj.get('text', {}).get('length', 0),
+                'tables': len(page_obj.get('tables') or []),
+                'time_ms': round((time.time() - t_p0)*1000, 2),
+                'cache': cache_hit,
+                'error': page_obj.get('text', {}).get('error') or page_obj.get('tables_meta', {}).get('error') if page_obj.get('tables_meta') else None
             })
+        # Persist manifest
+        try:
+            with open(manifest_path, 'w', encoding='utf-8') as mf:
+                json.dump(manifest, mf, ensure_ascii=False, separators=(',', ':'), indent=None)
+        except Exception as e:
+            logger.warning(f"[cache] manifest write failed: {e}")
         total_ms = (time.time()-t_start)*1000
         meta = {
             "pages_requested": len(selected),
@@ -922,16 +953,8 @@ async def analyze(
             "pages_failed": failed_pages,
         }
         response_obj = {"lang": lang_norm, "pages": pages_out,
-                        "progress": progress, "meta": meta, "hash": doc_hash}
-        # Store in cache (best-effort)
-        try:
-            with open(cache_path, 'w', encoding='utf-8') as cf:
-                json.dump(response_obj, cf, ensure_ascii=False,
-                          separators=(',', ':'), indent=None)
-            logger.info(
-                f"[cache] stored hash={doc_hash} bytes={os.path.getsize(cache_path)}")
-        except Exception as e:
-            logger.warning(f"[cache] write failed: {e}")
+                        "progress": progress, "meta": meta, "hash": base_hash}
+        # No whole-document cache write now; per-page + manifest only
         return JSONResponse(content=response_obj)
     except HTTPException:
         raise
