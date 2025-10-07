@@ -3,7 +3,7 @@ import os
 from typing import List, Dict, Any, Optional, Iterable
 from PIL import Image
 import pdf2image
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.responses import JSONResponse
 from paddleocr import PaddleOCR
 import inspect
@@ -11,12 +11,65 @@ import logging
 import numpy as np
 import hashlib
 import json
+import traceback
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Enhanced logging initialization (idempotent)
+_DEF_LOG_FORMAT = os.getenv(
+    "OCR_LOG_FORMAT", "%(asctime)s %(levelname)s %(name)s %(message)s")
+_DEF_LOG_LEVEL = os.getenv("OCR_LOG_LEVEL", "INFO").upper()
+for _h in list(logger.handlers):
+    pass  # leave existing handlers (basicConfig already set)
+try:
+    logging.getLogger().setLevel(_DEF_LOG_LEVEL)
+    for h in logging.getLogger().handlers:
+        try:
+            if hasattr(h, 'setFormatter'):
+                h.setFormatter(logging.Formatter(_DEF_LOG_FORMAT))
+        except Exception:
+            pass
+except Exception:
+    logger.warning("Failed to reconfigure root logger level/format")
+
+ENABLE_TRACE = os.getenv("OCR_TRACE", "0").lower() in {"1", "true", "yes"}
+INCLUDE_TRACE_IN_JSON = os.getenv("OCR_INCLUDE_TRACE", "0").lower() in {
+    "1", "true", "yes"}
+TRACE_TAIL_LEN = int(os.getenv("OCR_TRACE_TAIL", "4000") or 4000)
+
 app = FastAPI(title="PaddleOCR API",
               description="CPU-only OCR service", version="1.1.2")
+
+# Middleware to log unhandled exceptions (safety net)
+
+
+@app.middleware("http")
+async def exception_logging_middleware(request: Request, call_next):
+    try:
+        response = await call_next(request)
+        return response
+    except HTTPException:
+        raise
+    except Exception as e:
+        if ENABLE_TRACE:
+            logger.exception(
+                f"[middleware] Unhandled exception {type(e).__name__}: {e}")
+        else:
+            logger.error(
+                f"[middleware] Unhandled exception {type(e).__name__}: {e}")
+        tb_tail = None
+        if INCLUDE_TRACE_IN_JSON and ENABLE_TRACE:
+            try:
+                tb_tail = ''.join(traceback.format_exception(
+                    type(e), e, e.__traceback__))[-TRACE_TAIL_LEN:]
+            except Exception:
+                tb_tail = None
+        detail = f"Unhandled server error: {type(e).__name__}: {e}"
+        if tb_tail:
+            detail += " | trace_tail=" + tb_tail
+        raise HTTPException(status_code=500, detail=detail)
+
 
 # A pragmatic (not exhaustive) set of commonly used language codes that PaddleOCR accepts.
 # Full list in PaddleOCR docs is large; models will auto-download on first use for a given lang code.
@@ -135,7 +188,10 @@ def pdf_to_images(pdf_bytes: bytes, dpi: int = 350) -> List[Image.Image]:
         # rasterization to reduce end-to-end latency.
         return pdf2image.convert_from_bytes(pdf_bytes, dpi=dpi, fmt='RGB')
     except Exception as e:
-        logger.error(f"Error converting PDF: {e}")
+        if ENABLE_TRACE:
+            logger.exception(f"Error converting PDF")
+        else:
+            logger.error(f"Error converting PDF: {e}")
         raise HTTPException(
             status_code=400, detail=f"Error processing PDF: {e}")
 
@@ -517,8 +573,21 @@ def extract_text_from_image(image: Image.Image, lang: str) -> Dict[str, Any]:
         sanitized = _sanitize_raw(result)
         return {"full_text": full_text, "lines": structured, "raw": result if debug else None, "raw_truncated": raw_truncated, "raw_full": sanitized, "stats": stats}
     except Exception as e:
-        logger.error(f"Error extracting text: {e}")
-        return {"full_text": "", "lines": []}
+        if ENABLE_TRACE:
+            logger.exception("Error extracting text")
+        else:
+            logger.error(f"Error extracting text: {e}")
+        trace_tail = None
+        if ENABLE_TRACE and INCLUDE_TRACE_IN_JSON:
+            try:
+                trace_tail = ''.join(traceback.format_exception(
+                    type(e), e, e.__traceback__))[-TRACE_TAIL_LEN:]
+            except Exception:
+                trace_tail = None
+        err_obj = {"full_text": "", "lines": []}
+        if trace_tail:
+            err_obj["trace_tail"] = trace_tail
+        return err_obj
 
 
 def extract_tables_from_image(image: Image.Image, debug: bool = False) -> Dict[str, Any]:
@@ -628,8 +697,22 @@ def extract_tables_from_image(image: Image.Image, debug: bool = False) -> Dict[s
         sanitized = _sanitize_raw(result)
         return {"tables": tables, "raw": result if debug else None, "raw_summary": raw_summary, "raw_truncated": raw_truncated, "raw_full": sanitized}
     except Exception as e:
-        logger.error(f"Error extracting tables: {e}")
-        return {"tables": [], "raw": None, "raw_truncated": None, "error": str(e)}
+        if ENABLE_TRACE:
+            logger.exception("Error extracting tables")
+        else:
+            logger.error(f"Error extracting tables: {e}")
+        trace_tail = None
+        if ENABLE_TRACE and INCLUDE_TRACE_IN_JSON:
+            try:
+                trace_tail = ''.join(traceback.format_exception(
+                    type(e), e, e.__traceback__))[-TRACE_TAIL_LEN:]
+            except Exception:
+                trace_tail = None
+        err_obj = {"tables": [], "raw": None,
+                   "raw_truncated": None, "error": str(e)}
+        if trace_tail:
+            err_obj["trace_tail"] = trace_tail
+        return err_obj
 
 
 def process_image(image: Image.Image, page_index: int, lang: str, do_tables: bool, debug: bool) -> Dict[str, Any]:
@@ -642,9 +725,22 @@ def process_image(image: Image.Image, page_index: int, lang: str, do_tables: boo
     try:
         text_struct = extract_text_from_image(image, lang)
     except Exception as e:
-        logger.error(
-            f"[page {page_index}] OCR fatal error: {type(e).__name__}: {e}")
+        if ENABLE_TRACE:
+            logger.exception(
+                f"[page {page_index}] OCR fatal error")
+        else:
+            logger.error(
+                f"[page {page_index}] OCR fatal error: {type(e).__name__}: {e}")
+        trace_tail = None
+        if ENABLE_TRACE and INCLUDE_TRACE_IN_JSON:
+            try:
+                trace_tail = ''.join(traceback.format_exception(
+                    type(e), e, e.__traceback__))[-TRACE_TAIL_LEN:]
+            except Exception:
+                trace_tail = None
         text_struct = {"full_text": "", "lines": [], "error": str(e)}
+        if trace_tail:
+            text_struct["trace_tail"] = trace_tail
     ocr_ms = (time.time() - t0)*1000
     t1 = time.time()
     table_struct: Dict[str, Any] = {"tables": []}
@@ -652,9 +748,22 @@ def process_image(image: Image.Image, page_index: int, lang: str, do_tables: boo
         try:
             table_struct = extract_tables_from_image(image, debug)
         except Exception as e:
-            logger.error(
-                f"[page {page_index}] table fatal error: {type(e).__name__}: {e}")
+            if ENABLE_TRACE:
+                logger.exception(
+                    f"[page {page_index}] table fatal error")
+            else:
+                logger.error(
+                    f"[page {page_index}] table fatal error: {type(e).__name__}: {e}")
+            trace_tail = None
+            if ENABLE_TRACE and INCLUDE_TRACE_IN_JSON:
+                try:
+                    trace_tail = ''.join(traceback.format_exception(
+                        type(e), e, e.__traceback__))[-TRACE_TAIL_LEN:]
+                except Exception:
+                    trace_tail = None
             table_struct = {"tables": [], "error": str(e)}
+            if trace_tail:
+                table_struct["trace_tail"] = trace_tail
     table_ms = (time.time() - t1)*1000 if do_tables else 0.0
     text_full = text_struct["full_text"]
     stats = text_struct.get('stats') or {}
@@ -896,18 +1005,23 @@ async def analyze(
                         cache_hit = True
                         logger.info(f"[cache:page] hit file={cache_filename}")
                     else:
-                        page_obj = process_image(img, idx, lang_norm, tables, debug)
+                        page_obj = process_image(
+                            img, idx, lang_norm, tables, debug)
                 except Exception as e:
-                    logger.warning(f"[cache:page] read failed {cache_filename}: {e}; recompute")
-                    page_obj = process_image(img, idx, lang_norm, tables, debug)
+                    logger.warning(
+                        f"[cache:page] read failed {cache_filename}: {e}; recompute")
+                    page_obj = process_image(
+                        img, idx, lang_norm, tables, debug)
             else:
                 page_obj = process_image(img, idx, lang_norm, tables, debug)
                 # Persist page
                 try:
                     with open(page_cache_path, 'w', encoding='utf-8') as pf:
-                        json.dump(page_obj, pf, ensure_ascii=False, separators=(',', ':'), indent=None)
+                        json.dump(page_obj, pf, ensure_ascii=False,
+                                  separators=(',', ':'), indent=None)
                 except Exception as e:
-                    logger.warning(f"[cache:page] write failed {cache_filename}: {e}")
+                    logger.warning(
+                        f"[cache:page] write failed {cache_filename}: {e}")
             if page_obj.get('text', {}).get('error'):
                 failed_pages += 1
             pages_out.append(page_obj)
@@ -943,9 +1057,22 @@ async def analyze(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error processing document: {type(e).__name__}: {e}")
+        if ENABLE_TRACE:
+            logger.exception(f"Error processing document")
+        else:
+            logger.error(f"Error processing document: {type(e).__name__}: {e}")
+        trace_tail = None
+        if ENABLE_TRACE and INCLUDE_TRACE_IN_JSON:
+            try:
+                trace_tail = ''.join(traceback.format_exception(
+                    type(e), e, e.__traceback__))[-TRACE_TAIL_LEN:]
+            except Exception:
+                trace_tail = None
+        detail = f"Document-level failure: {type(e).__name__}: {e}"
+        if trace_tail:
+            detail += " | trace_tail=" + trace_tail
         raise HTTPException(
-            status_code=500, detail=f"Document-level failure: {type(e).__name__}: {e}")
+            status_code=500, detail=detail)
 
 if __name__ == '__main__':
     import uvicorn
