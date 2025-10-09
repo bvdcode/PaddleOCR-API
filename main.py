@@ -13,6 +13,17 @@ import hashlib
 import json
 import traceback
 
+# Helper for accessing bbox regardless of representation
+
+def _bbox_as_list(b):
+    if b is None:
+        return None
+    if isinstance(b, (list, tuple)) and len(b) == 4 and all(isinstance(v, (int, float)) for v in b):
+        return [float(b[0]), float(b[1]), float(b[2]), float(b[3])]
+    if isinstance(b, dict) and all(k in b for k in ('x1','y1','x2','y2')):
+        return [float(b['x1']), float(b['y1']), float(b['x2']), float(b['y2'])]
+    return None
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -650,16 +661,14 @@ def extract_tables_from_image(image: Image.Image, debug: bool = False) -> Dict[s
                                     {'text': txt, 'bbox': bbox})
                 # Simple row clustering by vertical overlap
                 rows: List[List[Dict[str, Any]]] = []
-                for line in sorted(candidate_lines, key=lambda x: x['bbox'][1]):
+                for line in sorted(candidate_lines, key=lambda x: (_bbox_as_list(x.get('bbox')) or [0,0,0,0])[1]):
                     placed = False
                     for row in rows:
                         # if vertical intersection > 40% treat as same row
-                        y_min = max(line['bbox'][1], min(
-                            c['bbox'][1] for c in row))
-                        y_max = min(line['bbox'][3], max(
-                            c['bbox'][3] for c in row))
-                        h = min(line['bbox'][3]-line['bbox'][1], max(c['bbox'][3]
-                                for c in row)-min(c['bbox'][1] for c in row))
+                        y_min = max((_bbox_as_list(line['bbox']) or [0,0,0,0])[1], min((_bbox_as_list(c['bbox']) or [0,0,0,0])[1] for c in row))
+                        y_max = min((_bbox_as_list(line['bbox']) or [0,0,0,0])[3], max((_bbox_as_list(c['bbox']) or [0,0,0,0])[3] for c in row))
+                        h = min(((_bbox_as_list(line['bbox']) or [0,0,0,0])[3]-(_bbox_as_list(line['bbox']) or [0,0,0,0])[1]), max((_bbox_as_list(c['bbox']) or [0,0,0,0])[3]
+                                for c in row)-min((_bbox_as_list(c['bbox']) or [0,0,0,0])[1] for c in row))
                         if h > 0 and (y_max - y_min) / h >= 0.4:
                             row.append(line)
                             placed = True
@@ -853,13 +862,13 @@ def process_image(image: Image.Image, page_index: int, lang: str, do_tables: boo
         if len(lines_with_bbox) >= 12:
             # Cluster by y into rows
             rows: List[List[Dict[str, Any]]] = []
-            for ln in sorted(lines_with_bbox, key=lambda x: x['bbox'][1]):
+            for ln in sorted(lines_with_bbox, key=lambda x: (_bbox_as_list(x.get('bbox')) or [0,0,0,0])[1]):
                 placed = False
                 for r in rows:
-                    y_min = max(ln['bbox'][1], min(c['bbox'][1] for c in r))
-                    y_max = min(ln['bbox'][3], max(c['bbox'][3] for c in r))
-                    h = min(ln['bbox'][3]-ln['bbox'][1], max(c['bbox'][3]
-                            for c in r)-min(c['bbox'][1] for c in r))
+                    y_min = max((_bbox_as_list(ln['bbox']) or [0,0,0,0])[1], min((_bbox_as_list(c['bbox']) or [0,0,0,0])[1] for c in r))
+                    y_max = min((_bbox_as_list(ln['bbox']) or [0,0,0,0])[3], max((_bbox_as_list(c['bbox']) or [0,0,0,0])[3] for c in r))
+                    h = min(((_bbox_as_list(ln['bbox']) or [0,0,0,0])[3]-(_bbox_as_list(ln['bbox']) or [0,0,0,0])[1]), max((_bbox_as_list(c['bbox']) or [0,0,0,0])[3]
+                            for c in r)-min((_bbox_as_list(c['bbox']) or [0,0,0,0])[1] for c in r))
                     if h > 0 and (y_max - y_min)/h >= 0.4:
                         r.append(ln)
                         placed = True
