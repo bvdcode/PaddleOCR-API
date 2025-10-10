@@ -34,5 +34,9 @@ EXPOSE 8000
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONIOENCODING=utf-8
 
+ENV OCR_TRACE=1
+ENV OCR_INCLUDE_TRACE=1
+ENV OCR_LOG_LEVEL=DEBUG
+
 # Run the application
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

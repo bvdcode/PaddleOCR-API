@@ -679,10 +679,10 @@ def extract_tables_from_image(image: Image.Image, debug: bool = False) -> Dict[s
                 if rows and sum(len(r) for r in rows) >= 6 and any(len(r) >= 2 for r in rows):
                     # Flatten into cells
                     all_cells = []
-                    x1 = min(min(c['bbox'][0] for c in r) for r in rows)
-                    y1 = min(min(c['bbox'][1] for c in r) for r in rows)
-                    x2 = max(max(c['bbox'][2] for c in r) for r in rows)
-                    y2 = max(max(c['bbox'][3] for c in r) for r in rows)
+                    x1 = min(min((_bbox_as_list(c['bbox']) or [0,0,0,0])[0] for c in r) for r in rows)
+                    y1 = min(min((_bbox_as_list(c['bbox']) or [0,0,0,0])[1] for c in r) for r in rows)
+                    x2 = max(max((_bbox_as_list(c['bbox']) or [0,0,0,0])[2] for c in r) for r in rows)
+                    y2 = max(max((_bbox_as_list(c['bbox']) or [0,0,0,0])[3] for c in r) for r in rows)
                     for r in rows:
                         for c in r:
                             all_cells.append(
