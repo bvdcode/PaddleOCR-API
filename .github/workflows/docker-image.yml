@@ -18,13 +18,23 @@ jobs:
     name: push docker image to hub
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - name: check repository
         uses: actions/checkout@v4
         with:
           lfs: "true"
+          fetch-depth: 0
+
+      - name: Install GitVersion
+        uses: GitTools/actions/gitversion/setup@v4.7.0
+        with:
+          versionSpec: 6.8.2
+
+      - name: Determine version
+        id: gitversion
+        uses: GitTools/actions/gitversion/execute@v4.7.0
 
       - name: login to docker registry
         uses: docker/login-action@v3
@@ -39,6 +49,7 @@ jobs:
           push: true
           tags: |
             ${{ env.DOCKER_NAMESPACE }}/${{ env.DOCKER_IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.DOCKER_NAMESPACE }}/${{ env.DOCKER_IMAGE_NAME }}:v${{ steps.gitversion.outputs.MajorMinorPatch }}
             ${{ env.DOCKER_NAMESPACE }}/${{ env.DOCKER_IMAGE_NAME }}:latest
           file: ${{ env.DOCKERFILE }}
 
@@ -56,5 +67,16 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository_owner }}/${{ env.DOCKER_IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.DOCKER_IMAGE_NAME }}:v${{ steps.gitversion.outputs.MajorMinorPatch }}
             ghcr.io/${{ github.repository_owner }}/${{ env.DOCKER_IMAGE_NAME }}:latest
           file: ${{ env.DOCKERFILE }}
+
+      - name: Record published version
+        if: github.ref == 'refs/heads/main'
+        env:
+          RELEASE_TAG: v${{ steps.gitversion.outputs.MajorMinorPatch }}
+        run: |
+          if ! git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            git tag "$RELEASE_TAG" "$GITHUB_SHA"
+            git push origin "refs/tags/$RELEASE_TAG"
+          fi
